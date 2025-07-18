@@ -268,7 +268,7 @@ class SearchService:
             if entity_type in ['business_term', 'unknown']:
                 dict_entries = DataDictionary.query.filter_by(project_id=project_id).all()
                 
-                for entry in entries:
+                for entry in dict_entries:
                     term_lower = entry.term.lower()
                     if query_lower in term_lower:
                         score = 1.0 if query_lower == term_lower else 0.8

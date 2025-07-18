@@ -120,9 +120,9 @@ class DataService:
                 "status": "error",
                 "message": f"CSV processing failed: {str(e)}"
             }
-    
+        
     def _process_excel(self, file_path: str, project_id: int, 
-                      data_source_id: int) -> Dict[str, Any]:
+                    data_source_id: int) -> Dict[str, Any]:
         """Process Excel file (multiple sheets)"""
         try:
             # Read all sheets
@@ -132,30 +132,37 @@ class DataService:
             db_path = self._get_project_db_path(project_id)
             
             for sheet_name in excel_file.sheet_names:
-                # Read sheet
-                df = pd.read_excel(file_path, sheet_name=sheet_name)
-                
-                # Skip empty sheets
-                if df.empty:
+                try:
+                    # Read sheet
+                    df = pd.read_excel(file_path, sheet_name=sheet_name)
+                    
+                    # Skip empty sheets
+                    if df.empty:
+                        current_app.logger.info(f"Skipping empty sheet: {sheet_name}")
+                        continue
+                    
+                    # Clean column names
+                    df.columns = [self._clean_column_name(col) for col in df.columns]
+                    
+                    # Create table name
+                    base_name = os.path.splitext(os.path.basename(file_path))[0]
+                    table_name = self._clean_table_name(f"{base_name}_{sheet_name}")
+                    
+                    # Create database table
+                    result = self._create_db_table(df, db_path, table_name)
+                    
+                    if result['status'] == 'success':
+                        # Create table info record
+                        table_info = self._create_table_info(
+                            project_id, data_source_id, table_name, sheet_name, df
+                        )
+                        tables_created.append(table_info.to_dict())
+                    else:
+                        current_app.logger.warning(f"Failed to process sheet {sheet_name}: {result.get('message')}")
+                        
+                except Exception as e:
+                    current_app.logger.error(f"Error processing sheet {sheet_name}: {str(e)}")
                     continue
-                
-                # Clean column names
-                df.columns = [self._clean_column_name(col) for col in df.columns]
-                
-                # Create table name
-                table_name = self._clean_table_name(f"{os.path.splitext(os.path.basename(file_path))[0]}_{sheet_name}")
-                
-                # Create database table
-                result = self._create_db_table(df, db_path, table_name)
-                
-                if result['status'] == 'success':
-                    # Create table info record
-                    table_info = self._create_table_info(
-                        project_id, data_source_id, table_name, sheet_name, df
-                    )
-                    tables_created.append(table_info.to_dict())
-                else:
-                    current_app.logger.warning(f"Failed to process sheet {sheet_name}: {result.get('message')}")
             
             if tables_created:
                 return {
@@ -174,10 +181,10 @@ class DataService:
             return {
                 "status": "error",
                 "message": f"Excel processing failed: {str(e)}"
-            }
-    
+            }        
+
     def _process_json(self, file_path: str, project_id: int, 
-                     data_source_id: int) -> Dict[str, Any]:
+                    data_source_id: int) -> Dict[str, Any]:
         """Process JSON file"""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -234,79 +241,115 @@ class DataService:
                 "status": "error",
                 "message": f"JSON processing failed: {str(e)}"
             }
-    
+
     def _create_db_table(self, df: pd.DataFrame, db_path: str, 
                         table_name: str) -> Dict[str, Any]:
-        """Create SQLite table from DataFrame"""
+        """Create SQLite table from DataFrame with proper data type handling"""
         try:
             # Ensure directory exists
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
             
             # Connect to database
-            conn = sqlite3.connect(db_path)
-            
-            # Handle mixed data types
-            df_clean = df.copy()
-            
-            # Convert object columns to string where appropriate
-            for col in df_clean.columns:
-                if df_clean[col].dtype == 'object':
-                    # Try to convert to numeric first
-                    try:
-                        numeric_series = pd.to_numeric(df_clean[col], errors='coerce')
-                        if numeric_series.notna().sum() / len(df_clean) > 0.8:  # 80% numeric
-                            df_clean[col] = numeric_series
-                        else:
-                            df_clean[col] = df_clean[col].astype(str)
-                    except:
+            with sqlite3.connect(db_path) as conn:
+                # Clean data before insertion
+                df_clean = df.copy()
+                
+                # Handle different data types properly
+                for col in df_clean.columns:
+                    if df_clean[col].dtype == 'object':
+                        # Handle mixed types and NaN values in object columns
                         df_clean[col] = df_clean[col].astype(str)
-            
-            # Save to database
-            df_clean.to_sql(table_name, conn, if_exists='replace', index=False)
-            conn.close()
-            
-            return {
-                "status": "success",
-                "message": f"Table {table_name} created successfully"
-            }
-            
+                        df_clean[col] = df_clean[col].replace(['nan', 'None', 'NaT'], '')
+                    elif pd.api.types.is_numeric_dtype(df_clean[col]):
+                        # Round numeric values to 3 decimal places as requested
+                        df_clean[col] = df_clean[col].round(3)
+                        # Fill NaN with None for proper NULL handling in SQLite
+                        df_clean[col] = df_clean[col].where(pd.notnull(df_clean[col]), None)
+                    elif pd.api.types.is_bool_dtype(df_clean[col]):
+                        # Convert boolean to integer (SQLite doesn't have native boolean)
+                        df_clean[col] = df_clean[col].astype(int)
+                    elif pd.api.types.is_datetime64_any_dtype(df_clean[col]):
+                        # Convert datetime to string for SQLite
+                        df_clean[col] = df_clean[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+                        df_clean[col] = df_clean[col].fillna('')
+                
+                # Create table (replace if exists)
+                df_clean.to_sql(table_name, conn, if_exists='replace', index=False)
+                
+                return {
+                    "status": "success",
+                    "message": f"Table {table_name} created successfully",
+                    "row_count": len(df_clean),
+                    "column_count": len(df_clean.columns)
+                }
+                
         except Exception as e:
             current_app.logger.error(f"Database table creation error: {str(e)}")
             return {
                 "status": "error",
-                "message": f"Failed to create database table: {str(e)}"
+                "message": f"Table creation failed: {str(e)}"
             }
-    
+
     def _create_table_info(self, project_id: int, data_source_id: int, 
-                          table_name: str, original_name: str, 
-                          df: pd.DataFrame) -> TableInfo:
-        """Create TableInfo record with schema and sample data"""
+                        table_name: str, original_name: str, df: pd.DataFrame) -> TableInfo:
+        """Create TableInfo record with proper JSON serialization"""
         try:
+            # Generate column information with JSON-safe types
+            columns_info = []
+            sample_data = []
+            
+            # Get sample rows (first 5 rows) for sample data
+            if not df.empty:
+                sample_rows = df.head(5).to_dict('records')
+                # Convert to JSON-safe format
+                for row in sample_rows:
+                    clean_row = {}
+                    for key, value in row.items():
+                        if pd.isna(value):
+                            clean_row[key] = None
+                        elif isinstance(value, (bool, np.bool_)):
+                            clean_row[key] = bool(value)  # Convert numpy bool to Python bool
+                        elif isinstance(value, (int, np.integer)):
+                            clean_row[key] = int(value)
+                        elif isinstance(value, (float, np.floating)):
+                            # Round to 3 decimal places as requested
+                            clean_row[key] = round(float(value), 3) if not pd.isna(value) else None
+                        else:
+                            clean_row[key] = str(value)
+                    sample_data.append(clean_row)
+            
             # Generate schema information
             schema = {
-                'columns': [],
-                'indexes': [],
-                'constraints': []
+                'table_name': table_name,
+                'columns': []
             }
             
-            # Get sample data (first 5 rows)
-            sample_data = df.head(5).to_dict('records')
-            
-            # Process each column
             for col in df.columns:
+                # Get basic column info
                 col_info = {
                     'name': col,
                     'type': str(df[col].dtype),
-                    'nullable': df[col].isnull().any(),
-                    'unique_count': df[col].nunique(),
-                    'sample_values': df[col].dropna().head(5).tolist()
+                    'nullable': bool(df[col].isnull().any()),  # Explicitly convert to Python bool
+                    'unique_count': int(df[col].nunique()) if not df.empty else 0,
+                    'null_count': int(df[col].isnull().sum()) if not df.empty else 0
                 }
                 
-                # Detect data type
+                # Get sample values (non-null, first 3 unique values)
+                sample_values = df[col].dropna().unique()[:3].tolist()
+                col_info['sample_values'] = [str(v) for v in sample_values]
+                
+                # Detect data type and add type-specific info
                 if pd.api.types.is_numeric_dtype(df[col]):
                     col_info['data_type'] = 'numeric'
-                    col_info['min_value'] = float(df[col].min()) if not df[col].empty else None
-                    col_info['max_value'] = float(df[col].max()) if not df[col].empty else None
+                    if not df[col].empty:
+                        min_val = float(df[col].min())
+                        max_val = float(df[col].max())
+                        # Round to 3 decimal places as requested
+                        col_info['min_value'] = round(min_val, 3) if not pd.isna(min_val) else None
+                        col_info['max_value'] = round(max_val, 3) if not pd.isna(max_val) else None
+                    else:
+                        col_info['min_value'] = None
+                        col_info['max_value'] = None
                 elif pd.api.types.is_datetime64_any_dtype(df[col]):
                     col_info['data_type'] = 'datetime'
                 else:
@@ -325,6 +368,7 @@ class DataService:
                 column_count=len(df.columns)
             )
             
+            # Set schema and sample data using the model methods
             table_info.set_schema(schema)
             table_info.set_sample_data(sample_data)
             
@@ -336,9 +380,63 @@ class DataService:
         except Exception as e:
             current_app.logger.error(f"Table info creation error: {str(e)}")
             raise e
-    
+
+    def _clean_column_name(self, column_name: str) -> str:
+        """Clean column name for database compatibility"""
+        # Convert to string if not already
+        column_name = str(column_name).strip()
+        
+        # Replace spaces and special characters with underscores
+        cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', column_name)
+        
+        # Remove multiple consecutive underscores
+        cleaned = re.sub(r'_+', '_', cleaned)
+        
+        # Remove leading/trailing underscores
+        cleaned = cleaned.strip('_')
+        
+        # Ensure it doesn't start with a number
+        if cleaned and cleaned[0].isdigit():
+            cleaned = f"col_{cleaned}"
+        
+        # Handle empty names
+        if not cleaned:
+            cleaned = "unnamed_column"
+        
+        return cleaned.lower()
+
+    def _clean_table_name(self, table_name: str) -> str:
+        """Clean table name for database compatibility"""
+        # Convert to string and strip whitespace
+        table_name = str(table_name).strip()
+        
+        # Replace special characters with underscores
+        cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', table_name)  # Fixed: use table_name not cleaned
+        
+        # Remove multiple consecutive underscores
+        cleaned = re.sub(r'_+', '_', cleaned)
+        
+        # Remove leading/trailing underscores
+        cleaned = cleaned.strip('_')
+        
+        # Ensure it doesn't start with a number
+        if cleaned and cleaned[0].isdigit():
+            cleaned = f"table_{cleaned}"
+        
+        # Handle empty names
+        if not cleaned:
+            cleaned = "unnamed_table"
+        
+        return cleaned.lower()
+
+    def _get_project_db_path(self, project_id: int) -> str:
+        """Get database file path for project"""
+        upload_folder = current_app.config['UPLOAD_FOLDER']
+        return os.path.join(upload_folder, f"project_{project_id}.db")
+
+
     def generate_data_dictionary(self, project_id: int, 
-                               config: Dict[str, Any] = None) -> Dict[str, Any]:
+                            config: Dict[str, Any] = None) -> Dict[str, Any]:
         """Auto-generate data dictionary from table schemas"""
         try:
             config = config or {}
@@ -346,24 +444,30 @@ class DataService:
             
             tables = TableInfo.query.filter_by(project_id=project_id).all()
             
+            if not tables:
+                return {
+                    "status": "error",
+                    "message": "No tables found to generate dictionary from"
+                }
+            
             for table in tables:
-                schema = table.get_schema()
+                schema = table.get_schema() if hasattr(table, 'get_schema') else {}
                 
                 # Generate table-level entry
                 table_entry = DataDictionary(
                     project_id=project_id,
                     term=table.table_name,
                     definition=f"Data table containing {table.row_count} rows and {table.column_count} columns",
-                    category='encyclopedia',
+                    category='table',
                     source_table=table.table_name,
-                    confidence_score=0.8
+                    confidence_score=0.85
                 )
                 
                 # Check if entry already exists
                 existing = DataDictionary.query.filter_by(
                     project_id=project_id,
                     term=table.table_name,
-                    category='encyclopedia'
+                    category='table'
                 ).first()
                 
                 if not existing:
@@ -371,16 +475,42 @@ class DataService:
                     entries_created += 1
                 
                 # Generate column-level entries
-                for column in schema.get('columns', []):
+                columns = schema.get('columns', []) if schema else []
+                
+                # If no schema info, try to get from database directly
+                if not columns:
+                    try:
+                        db_path = self._get_project_db_path(project_id)
+                        if os.path.exists(db_path):
+                            with sqlite3.connect(db_path) as conn:
+                                cursor = conn.cursor()
+                                cursor.execute(f"PRAGMA table_info({table.table_name})")
+                                table_info = cursor.fetchall()
+                                
+                                for col_info in table_info:
+                                    col_name = col_info[1]  # Column name
+                                    col_type = col_info[2]  # Column type
+                                    
+                                    columns.append({
+                                        'name': col_name,
+                                        'type': col_type,
+                                        'data_type': 'text' if 'text' in col_type.lower() else 'numeric' if any(x in col_type.lower() for x in ['int', 'real', 'num']) else 'unknown'
+                                    })
+                    except Exception as e:
+                        current_app.logger.warning(f"Could not extract column info for {table.table_name}: {str(e)}")
+                
+                for column in columns:
                     col_name = column['name']
                     
                     # Generate definition based on column properties
                     definition_parts = []
                     
                     if column.get('data_type') == 'numeric':
-                        definition_parts.append(f"Numeric field")
-                        if column.get('min_value') is not None:
-                            definition_parts.append(f"(range: {column['min_value']:.2f} - {column['max_value']:.2f})")
+                        definition_parts.append("Numeric field")
+                        if column.get('min_value') is not None and column.get('max_value') is not None:
+                            min_val = round(column['min_value'], 2) if isinstance(column['min_value'], float) else column['min_value']
+                            max_val = round(column['max_value'], 2) if isinstance(column['max_value'], float) else column['max_value']
+                            definition_parts.append(f"(range: {min_val} - {max_val})")
                     elif column.get('data_type') == 'datetime':
                         definition_parts.append("Date/time field")
                     else:
@@ -391,22 +521,22 @@ class DataService:
                     if column.get('unique_count'):
                         definition_parts.append(f"with {column['unique_count']} unique values")
                     
-                    definition = ' '.join(definition_parts)
+                    definition = ' '.join(definition_parts) if definition_parts else f"Column in {table.table_name} table"
                     
                     # Create column entry
                     col_entry = DataDictionary(
                         project_id=project_id,
                         term=col_name,
                         definition=definition,
-                        category='encyclopedia',
+                        category='column',
                         source_table=table.table_name,
                         source_column=col_name,
-                        confidence_score=0.7
+                        confidence_score=0.75
                     )
                     
                     # Set examples from sample values
                     sample_values = column.get('sample_values', [])
-                    if sample_values:
+                    if sample_values and hasattr(col_entry, 'set_examples'):
                         col_entry.set_examples([str(v) for v in sample_values[:3]])
                     
                     # Check if entry already exists
@@ -421,8 +551,9 @@ class DataService:
                         db.session.add(col_entry)
                         entries_created += 1
                 
-                # Generate abbreviations from column names
-                abbreviations = self._extract_abbreviations([col['name'] for col in schema.get('columns', [])])
+                # Generate potential abbreviations from column names
+                column_names = [col['name'] for col in columns]
+                abbreviations = self._extract_abbreviations(column_names)
                 
                 for abbr, expansion in abbreviations.items():
                     abbr_entry = DataDictionary(
@@ -431,7 +562,7 @@ class DataService:
                         definition=f"Abbreviation for '{expansion}'",
                         category='abbreviation',
                         source_table=table.table_name,
-                        confidence_score=0.6
+                        confidence_score=0.60
                     )
                     
                     # Check if entry already exists
@@ -454,12 +585,13 @@ class DataService:
             }
             
         except Exception as e:
+            db.session.rollback()
             current_app.logger.error(f"Data dictionary generation error: {str(e)}")
             return {
                 "status": "error",
                 "message": str(e)
             }
-    
+
     def _extract_abbreviations(self, column_names: List[str]) -> Dict[str, str]:
         """Extract potential abbreviations from column names"""
         abbreviations = {}
@@ -469,92 +601,53 @@ class DataService:
             'id': 'identifier',
             'qty': 'quantity',
             'amt': 'amount',
+            'num': 'number',
             'desc': 'description',
             'addr': 'address',
-            'num': 'number',
-            'dt': 'date',
-            'tm': 'time',
-            'cd': 'code',
-            'nm': 'name',
-            'val': 'value',
-            'pct': 'percent',
-            'cnt': 'count',
-            'avg': 'average',
+            'tel': 'telephone',
+            'fax': 'facsimile',
+            'ref': 'reference',
+            'seq': 'sequence',
+            'temp': 'temperature',
             'max': 'maximum',
             'min': 'minimum',
+            'avg': 'average',
             'std': 'standard',
-            'temp': 'temperature'
+            'pct': 'percent',
+            'cnt': 'count',
+            'src': 'source',
+            'dest': 'destination',
+            'curr': 'current',
+            'prev': 'previous',
+            'yr': 'year',
+            'mo': 'month',
+            'dt': 'date',
+            'tm': 'time',
+            'ts': 'timestamp'
         }
         
         for col_name in column_names:
-            # Split by common separators
-            parts = re.split(r'[_\-\s]', col_name.lower())
+            # Split column name by underscores
+            parts = col_name.lower().split('_')
             
             for part in parts:
                 if part in common_abbrevs:
-                    abbreviations[part.upper()] = common_abbrevs[part]
+                    abbreviations[part] = common_abbrevs[part]
                 
-                # Look for potential abbreviations (short words with consonants)
-                if len(part) <= 4 and len(part) >= 2:
-                    if not re.match(r'^[aeiou]+$', part):  # Not all vowels
-                        # This could be an abbreviation
-                        abbreviations[part.upper()] = f"Possible abbreviation found in column '{col_name}'"
+                # Check for common patterns
+                if len(part) <= 4 and part.endswith('_id'):
+                    base = part[:-3]
+                    if base:
+                        abbreviations[part] = f"{base} identifier"
+                
+                # Numbers at end might indicate sequence
+                if len(part) > 2 and part[-1].isdigit():
+                    base = part[:-1]
+                    if base in common_abbrevs:
+                        abbreviations[part] = f"{common_abbrevs[base]} {part[-1]}"
         
         return abbreviations
-    
-    def _clean_column_name(self, col_name: str) -> str:
-        """Clean and standardize column names"""
-        # Convert to string and strip whitespace
-        cleaned = str(col_name).strip()
-        
-        # Replace special characters with underscores
-        cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', cleaned)
-        
-        # Remove multiple consecutive underscores
-        cleaned = re.sub(r'_+', '_', cleaned)
-        
-        # Remove leading/trailing underscores
-        cleaned = cleaned.strip('_')
-        
-        # Ensure it doesn't start with a number
-        if cleaned and cleaned[0].isdigit():
-            cleaned = f"col_{cleaned}"
-        
-        # Handle empty names
-        if not cleaned:
-            cleaned = "unnamed_column"
-        
-        return cleaned
-    
-    def _clean_table_name(self, table_name: str) -> str:
-        """Clean and standardize table names"""
-        # Convert to string and strip whitespace
-        cleaned = str(table_name).strip()
-        
-        # Replace special characters with underscores
-        cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', cleaned)
-        
-        # Remove multiple consecutive underscores
-        cleaned = re.sub(r'_+', '_', cleaned)
-        
-        # Remove leading/trailing underscores
-        cleaned = cleaned.strip('_')
-        
-        # Ensure it doesn't start with a number
-        if cleaned and cleaned[0].isdigit():
-            cleaned = f"table_{cleaned}"
-        
-        # Handle empty names
-        if not cleaned:
-            cleaned = "unnamed_table"
-        
-        return cleaned.lower()
-    
-    def _get_project_db_path(self, project_id: int) -> str:
-        """Get database file path for project"""
-        upload_folder = current_app.config['UPLOAD_FOLDER']
-        return os.path.join(upload_folder, f"project_{project_id}.db")
-    
+
     def test_database_connection(self, connection_config: Dict[str, Any]) -> Dict[str, Any]:
         """Test database connection"""
         try:

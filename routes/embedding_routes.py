@@ -154,6 +154,23 @@ def create_index(project_id):
             if len(tables) != len(target_ids):
                 return jsonify({'error': 'Some target tables not found'}), 400
         
+        # Create index record
+        search_index = SearchIndex(
+            project_id=project_id,
+            index_name=index_name,
+            index_type=index_type,
+            target_type=target_type,
+            embedding_model_id=embedding_model_id,
+            status='building',
+            build_progress=0.0,
+            is_built=False
+        )
+        search_index.set_target_ids(target_ids)
+        search_index.set_build_config(config)
+        
+        db.session.add(search_index)
+        db.session.commit()
+        
         # Start index creation in background
         embedding_service = EmbeddingService()
         
@@ -171,22 +188,37 @@ def create_index(project_id):
                 else:
                     result = {'status': 'error', 'message': f'Unsupported index type: {index_type}'}
                 
+                # Update index status based on result
+                if result['status'] == 'success':
+                    search_index.status = 'ready'
+                    search_index.is_built = True
+                    search_index.build_progress = 100.0
+                else:
+                    search_index.status = 'error'
+                    search_index.error_message = result.get('message', 'Unknown error')
+                
+                db.session.commit()
                 current_app.logger.info(f"Index creation completed: {result}")
+                
             except Exception as e:
+                search_index.status = 'error'
+                search_index.error_message = str(e)
+                db.session.commit()
                 current_app.logger.error(f"Index creation failed: {str(e)}")
         
         # Start creation thread
         thread = threading.Thread(target=create_index_task)
-        thread.daemon = True
+        thread.daemon = True  # <-- COMPLETE THE MISSING LINE
         thread.start()
         
         return jsonify({
             'status': 'success',
             'message': f'Index creation started: {index_name}',
-            'index_name': index_name
+            'index': search_index.to_dict()
         }), 202
         
     except Exception as e:
+        db.session.rollback()
         current_app.logger.error(f"Create index error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 

@@ -93,8 +93,77 @@ def serve_react(path):
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
-    # … your existing upload logic …
-    pass
+    """Handle file upload and delegate to datasource service"""
+    try:
+        # Check if file is present
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Get project_id from form data
+        project_id = request.form.get('project_id')
+        if not project_id:
+            return jsonify({'error': 'Project ID is required'}), 400
+        
+        try:
+            project_id = int(project_id)
+        except ValueError:
+            return jsonify({'error': 'Invalid project ID'}), 400
+        
+        # Verify project exists - FIX: Use newer SQLAlchemy syntax
+        project = db.session.get(Project, project_id)
+        if not project:
+            return jsonify({'error': 'Project not found'}), 404
+        
+        # Validate file extension
+        filename = secure_filename(file.filename)
+        file_ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+        
+        if file_ext not in app.config['ALLOWED_EXTENSIONS']:
+            return jsonify({
+                'error': f'File type .{file_ext} not allowed. Supported types: {", ".join(app.config["ALLOWED_EXTENSIONS"])}'
+            }), 400
+        
+        # Create upload directory for project
+        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], str(project_id))
+        os.makedirs(upload_path, exist_ok=True)
+        
+        # Save file
+        file_path = os.path.join(upload_path, filename)
+        file.save(file_path)
+        
+        # Process file using DataService
+        data_service = DataService()
+        result = data_service.process_uploaded_file(file_path, project_id, filename)
+        
+        if result['status'] == 'success':
+            return jsonify({
+                'status': 'success',
+                'message': f'File {filename} uploaded and processed successfully',
+                'data_source': result.get('data_source'),
+                'tables': result.get('tables_created', [])
+            })
+        else:
+            # Clean up file on processing failure
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            return jsonify({
+                'status': 'error',
+                'message': result.get('message', 'File processing failed')
+            }), 500
+        
+    except Exception as e:
+        app.logger.error(f"Upload file error: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': f'Upload failed: {str(e)}'
+        }), 500
+
 
 def init_db():
     """Initialize the database"""
@@ -121,4 +190,4 @@ if __name__ == '__main__':
 
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_ENV') == 'development'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
