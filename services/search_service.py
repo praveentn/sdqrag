@@ -62,10 +62,41 @@ class SearchService:
             )
             
             return results
-            
+          
         except Exception as e:
             current_app.logger.error(f"Entity search error: {str(e)}")
             return results
+
+    def search_by_method(self, project_id: int, query: str, method: str,
+                        config: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Search using a specific method"""
+        config = config or {}
+        
+        try:
+            if method == 'semantic':
+                indexes = SearchIndex.query.filter_by(
+                    project_id=project_id,
+                    index_type='faiss',
+                    is_built=True,
+                    status='ready'
+                ).all()
+                return self._semantic_search(query, indexes, config)
+            
+            elif method == 'keyword':
+                return self._keyword_search(project_id, query, 'unknown', config)
+            
+            elif method == 'fuzzy':
+                return self._fuzzy_search(project_id, query, 'unknown', config)
+            
+            elif method == 'exact':
+                return self._exact_search(project_id, query, 'unknown', config)
+            
+            else:
+                return []
+                
+        except Exception as e:
+            current_app.logger.error(f"Method-specific search error: {str(e)}")
+            return []
     
     def _semantic_search(self, query: str, indexes: List[SearchIndex], 
                         config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -121,10 +152,91 @@ class SearchService:
                     result['query'] = query
                     results.append(result)
             
+            # If no TF-IDF indexes, fall back to simple text matching
+            if not tfidf_indexes:
+                fallback_results = self._simple_keyword_search(project_id, query, entity_type, config)
+                results.extend(fallback_results)
+            
             return results
             
         except Exception as e:
             current_app.logger.error(f"Keyword search error: {str(e)}")
+            return []
+
+    def _simple_keyword_search(self, project_id: int, query: str, entity_type: str,
+                              config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Simple keyword search fallback"""
+        results = []
+        query_lower = query.lower()
+        
+        try:
+            # Search table names
+            if entity_type in ['table', 'unknown']:
+                tables = TableInfo.query.filter_by(project_id=project_id).all()
+                
+                for table in tables:
+                    if query_lower in table.table_name.lower():
+                        score = 1.0 if query_lower == table.table_name.lower() else 0.8
+                        results.append({
+                            'type': 'table',
+                            'id': table.id,
+                            'name': table.table_name,
+                            'table_name': table.table_name,
+                            'description': table.description,
+                            'score': score,
+                            'search_method': 'keyword',
+                            'query': query,
+                            'source': 'table_names'
+                        })
+            
+            # Search column names
+            if entity_type in ['column', 'unknown']:
+                # Get columns from tables
+                tables = TableInfo.query.filter_by(project_id=project_id).all()
+                
+                for table in tables:
+                    schema = table.get_schema()
+                    columns = schema.get('columns', [])
+                    
+                    for column in columns:
+                        column_name = column.get('name', '')
+                        if query_lower in column_name.lower():
+                            score = 1.0 if query_lower == column_name.lower() else 0.8
+                            results.append({
+                                'type': 'column',
+                                'table_id': table.id,
+                                'table_name': table.table_name,
+                                'column_name': column_name,
+                                'data_type': column.get('type'),
+                                'score': score,
+                                'search_method': 'keyword',
+                                'query': query,
+                                'source': 'column_names'
+                            })
+            
+            # Search data dictionary
+            if entity_type in ['business_term', 'unknown']:
+                dict_entries = DataDictionary.query.filter_by(project_id=project_id).all()
+                
+                for entry in dict_entries:
+                    if (query_lower in entry.term.lower() or 
+                        (entry.definition and query_lower in entry.definition.lower())):
+                        score = 1.0 if query_lower == entry.term.lower() else 0.8
+                        results.append({
+                            'type': 'dictionary',
+                            'id': entry.id,
+                            'term': entry.term,
+                            'definition': entry.definition,
+                            'score': score,
+                            'search_method': 'keyword',
+                            'query': query,
+                            'source': 'data_dictionary'
+                        })
+            
+            return results
+            
+        except Exception as e:
+            current_app.logger.error(f"Simple keyword search error: {str(e)}")
             return []
     
     def _fuzzy_search(self, project_id: int, query: str, entity_type: str,
@@ -139,37 +251,38 @@ class SearchService:
                 tables = TableInfo.query.filter_by(project_id=project_id).all()
                 table_names = [(table.table_name, table.id, 'table') for table in tables]
                 
-                matches = process.extract(query, [name[0] for name in table_names], 
-                                        scorer=fuzz.ratio, limit=5)
-                
-                for match, score in matches:
-                    if score >= threshold:
-                        table_data = next((t for t in table_names if t[0] == match), None)
-                        if table_data:
-                            results.append({
-                                'type': 'table',
-                                'id': table_data[1],
-                                'name': table_data[0],
-                                'score': score / 100.0,  # Normalize to 0-1
-                                'search_method': 'fuzzy',
-                                'query': query,
-                                'source': 'table_names'
-                            })
+                if table_names:
+                    matches = process.extract(query, [name[0] for name in table_names],
+                                            scorer=fuzz.ratio, limit=5)
+                    
+                    for match, score in matches:
+                        if score >= threshold:
+                            table_data = next((t for t in table_names if t[0] == match), None)
+                            if table_data:
+                                table_obj = next((t for t in tables if t.id == table_data[1]), None)
+                                results.append({
+                                    'type': 'table',
+                                    'id': table_data[1],
+                                    'name': table_data[0],
+                                    'table_name': table_data[0],
+                                    'description': table_obj.description if table_obj else None,
+                                    'score': score / 100.0,
+                                    'search_method': 'fuzzy',
+                                    'query': query,
+                                    'source': 'table_names'
+                                })
             
             # Search column names
             if entity_type in ['column', 'unknown']:
+                # Get all columns from all tables
                 tables = TableInfo.query.filter_by(project_id=project_id).all()
                 column_data = []
                 
                 for table in tables:
                     schema = table.get_schema()
-                    for column in schema.get('columns', []):
-                        column_data.append((
-                            column['name'], 
-                            table.id, 
-                            table.table_name,
-                            column['name']
-                        ))
+                    columns = schema.get('columns', [])
+                    for column in columns:
+                        column_data.append((column.get('name', ''), table.id, table.table_name, column.get('name', '')))
                 
                 if column_data:
                     matches = process.extract(query, [col[0] for col in column_data],
@@ -203,10 +316,12 @@ class SearchService:
                         if score >= threshold:
                             term_data = next((t for t in dict_terms if t[0] == match), None)
                             if term_data:
+                                entry = next((e for e in dict_entries if e.id == term_data[1]), None)
                                 results.append({
                                     'type': 'dictionary',
                                     'id': term_data[1],
                                     'term': term_data[0],
+                                    'definition': entry.definition if entry else None,
                                     'score': score / 100.0,
                                     'search_method': 'fuzzy',
                                     'query': query,
@@ -237,6 +352,8 @@ class SearchService:
                             'type': 'table',
                             'id': table.id,
                             'name': table.table_name,
+                            'table_name': table.table_name,
+                            'description': table.description,
                             'score': score,
                             'search_method': 'exact',
                             'query': query,
@@ -249,15 +366,18 @@ class SearchService:
                 
                 for table in tables:
                     schema = table.get_schema()
-                    for column in schema.get('columns', []):
-                        column_name = column['name'].lower()
-                        if query_lower in column_name:
-                            score = 1.0 if query_lower == column_name else 0.8
+                    columns = schema.get('columns', [])
+                    
+                    for column in columns:
+                        column_name = column.get('name', '')
+                        if query_lower in column_name.lower():
+                            score = 1.0 if query_lower == column_name.lower() else 0.8
                             results.append({
                                 'type': 'column',
                                 'table_id': table.id,
                                 'table_name': table.table_name,
-                                'column_name': column['name'],
+                                'column_name': column_name,
+                                'data_type': column.get('type'),
                                 'score': score,
                                 'search_method': 'exact',
                                 'query': query,
@@ -269,9 +389,9 @@ class SearchService:
                 dict_entries = DataDictionary.query.filter_by(project_id=project_id).all()
                 
                 for entry in dict_entries:
-                    term_lower = entry.term.lower()
-                    if query_lower in term_lower:
-                        score = 1.0 if query_lower == term_lower else 0.8
+                    # Search in term
+                    if query_lower in entry.term.lower():
+                        score = 1.0 if query_lower == entry.term.lower() else 0.9
                         results.append({
                             'type': 'dictionary',
                             'id': entry.id,
@@ -280,25 +400,41 @@ class SearchService:
                             'score': score,
                             'search_method': 'exact',
                             'query': query,
-                            'source': 'data_dictionary'
+                            'source': 'dictionary_terms'
                         })
                     
-                    # Also search in aliases
-                    aliases = entry.get_aliases()
-                    for alias in aliases:
-                        if query_lower in alias.lower():
-                            score = 0.9 if query_lower == alias.lower() else 0.7
-                            results.append({
-                                'type': 'dictionary',
-                                'id': entry.id,
-                                'term': entry.term,
-                                'definition': entry.definition,
-                                'matched_alias': alias,
-                                'score': score,
-                                'search_method': 'exact',
-                                'query': query,
-                                'source': 'dictionary_aliases'
-                            })
+                    # Search in definition
+                    elif entry.definition and query_lower in entry.definition.lower():
+                        results.append({
+                            'type': 'dictionary',
+                            'id': entry.id,
+                            'term': entry.term,
+                            'definition': entry.definition,
+                            'score': 0.7,
+                            'search_method': 'exact',
+                            'query': query,
+                            'source': 'dictionary_definitions'
+                        })
+                    
+                    # Search in aliases if available
+                    try:
+                        aliases = entry.get_aliases() if hasattr(entry, 'get_aliases') else []
+                        for alias in aliases:
+                            if query_lower in alias.lower():
+                                score = 0.9 if query_lower == alias.lower() else 0.7
+                                results.append({
+                                    'type': 'dictionary',
+                                    'id': entry.id,
+                                    'term': entry.term,
+                                    'definition': entry.definition,
+                                    'matched_alias': alias,
+                                    'score': score,
+                                    'search_method': 'exact',
+                                    'query': query,
+                                    'source': 'dictionary_aliases'
+                                })
+                    except:
+                        pass  # Skip if aliases not available
             
             return results
             
@@ -383,38 +519,7 @@ class SearchService:
         except Exception as e:
             current_app.logger.error(f"Result combination error: {str(e)}")
             return []
-    
-    def search_by_method(self, project_id: int, query: str, method: str,
-                        config: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        """Search using a specific method"""
-        config = config or {}
-        
-        try:
-            if method == 'semantic':
-                indexes = SearchIndex.query.filter_by(
-                    project_id=project_id,
-                    index_type='faiss',
-                    is_built=True,
-                    status='ready'
-                ).all()
-                return self._semantic_search(query, indexes, config)
-            
-            elif method == 'keyword':
-                return self._keyword_search(project_id, query, 'unknown', config)
-            
-            elif method == 'fuzzy':
-                return self._fuzzy_search(project_id, query, 'unknown', config)
-            
-            elif method == 'exact':
-                return self._exact_search(project_id, query, 'unknown', config)
-            
-            else:
-                return []
-                
-        except Exception as e:
-            current_app.logger.error(f"Method-specific search error: {str(e)}")
-            return []
-    
+
     def get_table_schema_context(self, project_id: int, table_ids: List[int] = None) -> Dict[str, Any]:
         """Get schema context for tables in a project"""
         try:
@@ -450,80 +555,61 @@ class SearchService:
         except Exception as e:
             current_app.logger.error(f"Schema context error: {str(e)}")
             return {'tables': {}, 'relationships': [], 'dictionary': []}
-    
+
     def execute_sql_query(self, project_id: int, sql_query: str, 
                          limit: int = 100) -> Dict[str, Any]:
         """Execute SQL query on project data"""
         try:
             # Security validation
-            if not self._validate_sql_query(sql_query):
-                return {
-                    "status": "error",
-                    "message": "SQL query failed security validation",
-                    "results": []
-                }
+            sql_lower = sql_query.lower().strip()
             
-            # Get database path for project
+            # Only allow SELECT statements
+            if not sql_lower.startswith('select'):
+                return {'error': 'Only SELECT statements are allowed'}
+            
+            # Prevent dangerous operations
+            dangerous_keywords = ['drop', 'delete', 'insert', 'update', 'alter', 'create', 'truncate']
+            if any(keyword in sql_lower for keyword in dangerous_keywords):
+                return {'error': 'Dangerous SQL operations are not allowed'}
+            
+            # Get project database path
             db_path = self._get_project_db_path(project_id)
             if not os.path.exists(db_path):
-                return {
-                    "status": "error",
-                    "message": "Project database not found",
-                    "results": []
-                }
+                return {'error': 'Project database not found'}
             
             # Execute query
             conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row  # Enable column access by name
+            conn.row_factory = sqlite3.Row  # This enables column access by name
             cursor = conn.cursor()
             
             # Add LIMIT if not present
-            if 'LIMIT' not in sql_query.upper():
-                sql_query += f" LIMIT {limit}"
+            if 'limit' not in sql_lower:
+                sql_query = f"{sql_query.rstrip(';')} LIMIT {limit}"
             
             cursor.execute(sql_query)
             rows = cursor.fetchall()
             
-            # Convert to list of dictionaries
-            results = [dict(row) for row in rows]
+            # Convert to list of dicts
+            results = []
+            if rows:
+                columns = [description[0] for description in cursor.description]
+                for row in rows:
+                    results.append(dict(zip(columns, row)))
             
             conn.close()
             
             return {
-                "status": "success",
-                "message": "Query executed successfully",
-                "results": results,
-                "row_count": len(results),
-                "columns": list(results[0].keys()) if results else []
+                'status': 'success',
+                'data': results,
+                'row_count': len(results),
+                'columns': columns if rows else [],
+                'query': sql_query
             }
             
         except Exception as e:
             current_app.logger.error(f"SQL execution error: {str(e)}")
-            return {
-                "status": "error",
-                "message": str(e),
-                "results": []
-            }
-    
-    def _validate_sql_query(self, sql_query: str) -> bool:
-        """Validate SQL query for security"""
-        if not sql_query:
-            return False
-        
-        sql_upper = sql_query.upper().strip()
-        
-        # Must start with SELECT
-        if not sql_upper.startswith('SELECT'):
-            return False
-        
-        # Check for forbidden keywords
-        forbidden = current_app.config['SECURITY_CONFIG']['forbidden_sql_keywords']
-        for keyword in forbidden:
-            if keyword in sql_upper:
-                return False
-        
-        return True
-    
+            return {'error': str(e)}
+
     def _get_project_db_path(self, project_id: int) -> str:
-        """Get database path for project data"""
-        return os.path.join(current_app.config['UPLOAD_FOLDER'], f"project_{project_id}.db")
+        """Get the database path for a project"""
+        return f"data/project_{project_id}.db"

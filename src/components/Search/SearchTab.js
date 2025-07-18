@@ -104,8 +104,16 @@ const SearchTab = () => {
         const results = {};
         
         for (const methodId of selectedMethods) {
-          const result = await performSearch(methodId, query);
-          results[methodId] = result;
+          try {
+            const result = await performSearch(methodId, query);
+            results[methodId] = result;
+          } catch (error) {
+            console.error(`Error searching with ${methodId}:`, error);
+            results[methodId] = {
+              error: error.message || 'Search failed',
+              results: []
+            };
+          }
         }
         
         setSearchResults(results);
@@ -139,12 +147,30 @@ const SearchTab = () => {
     const data = await response.json();
     
     if (data.status === 'success') {
-      return {
-        results: data.results,
-        count: data.result_count,
-        method: data.method,
-        query: data.query
-      };
+      // Normalize the response structure
+      let results = data.results;
+      
+      // Handle different response structures
+      if (method === 'combined' && typeof results === 'object' && results !== null) {
+        // For combined search, extract the combined_results or use the whole object
+        return {
+          results: results.combined_results || results,
+          count: Array.isArray(results.combined_results) ? results.combined_results.length : 
+                 (data.result_count || 0),
+          method: data.method,
+          query: data.query,
+          details: results // Keep full details for combined search
+        };
+      } else {
+        // For single method search, ensure results is an array
+        const resultArray = Array.isArray(results) ? results : [];
+        return {
+          results: resultArray,
+          count: resultArray.length,
+          method: data.method,
+          query: data.query
+        };
+      }
     } else {
       throw new Error(data.error || 'Search failed');
     }
@@ -174,8 +200,29 @@ const SearchTab = () => {
       const data = await response.json();
 
       if (data.status === 'success') {
-        setSearchResults(data.results);
-        toast.success(`Compared ${data.methods_tested.length} methods`);
+        // Normalize the comparison results
+        const normalizedResults = {};
+        Object.entries(data.results || {}).forEach(([method, methodData]) => {
+          if (methodData.error) {
+            normalizedResults[method] = {
+              error: methodData.error,
+              results: []
+            };
+          } else {
+            // Ensure results is an array
+            let results = methodData.results || [];
+            if (!Array.isArray(results)) {
+              results = [];
+            }
+            normalizedResults[method] = {
+              results: results,
+              count: results.length
+            };
+          }
+        });
+        
+        setSearchResults(normalizedResults);
+        toast.success(`Compared ${Object.keys(normalizedResults).length} methods`);
       } else {
         toast.error('Comparison failed');
       }
@@ -288,252 +335,244 @@ const SearchTab = () => {
   }
 
   return (
-    <div className="h-full flex">
-      {/* Left Sidebar - Search Controls */}
-      <div className="w-80 bg-white border-r border-gray-200 flex flex-col">
-        <div className="p-6 border-b border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900">Search Testing</h2>
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-900">Search Testing</h2>
           <p className="text-sm text-gray-600 mt-1">
-            Test and compare different search methods
+            Test and compare different search methods for your data
           </p>
         </div>
+        <div className="flex items-center space-x-2">
+          <button
+            onClick={() => setBenchmarkMode(!benchmarkMode)}
+            className={`btn-secondary ${benchmarkMode ? 'bg-blue-100 text-blue-700' : ''}`}
+          >
+            <BeakerIcon className="h-4 w-4 mr-2" />
+            {benchmarkMode ? 'Exit Benchmark' : 'Benchmark Mode'}
+          </button>
+        </div>
+      </div>
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {/* Mode Toggle */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">Mode</label>
-            <div className="flex space-x-2">
-              <button
-                onClick={() => setBenchmarkMode(false)}
-                className={`flex-1 px-3 py-2 text-sm font-medium rounded-md ${
-                  !benchmarkMode
-                    ? 'bg-blue-100 text-blue-700 border border-blue-200'
-                    : 'bg-white text-gray-700 border border-gray-300'
-                }`}
-              >
-                Single Query
-              </button>
-              <button
-                onClick={() => setBenchmarkMode(true)}
-                className={`flex-1 px-3 py-2 text-sm font-medium rounded-md ${
-                  benchmarkMode
-                    ? 'bg-blue-100 text-blue-700 border border-blue-200'
-                    : 'bg-white text-gray-700 border border-gray-300'
-                }`}
-              >
-                Benchmark
-              </button>
-            </div>
-          </div>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Search Configuration */}
+        <div className="lg:col-span-1">
+          <div className="bg-white border border-gray-200 rounded-lg p-6">
+            <h3 className="text-lg font-medium text-gray-900 mb-4">
+              {benchmarkMode ? 'Benchmark Configuration' : 'Search Configuration'}
+            </h3>
 
-          {/* Search Query */}
-          {!benchmarkMode && (
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Search Query
-              </label>
-              <textarea
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Enter your search query..."
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                rows={3}
-              />
-              <button
-                onClick={handleAnalyzeQuery}
-                className="mt-2 text-sm text-blue-600 hover:text-blue-700"
-              >
-                <DocumentTextIcon className="h-4 w-4 inline mr-1" />
-                Analyze Query
-              </button>
-            </div>
-          )}
+            {!benchmarkMode ? (
+              <div className="space-y-4">
+                {/* Query Input */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Search Query
+                  </label>
+                  <input
+                    type="text"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Enter your search query..."
+                    className="w-full input-field"
+                    onKeyPress={(e) => e.key === 'Enter' && handleSearch()}
+                  />
+                </div>
 
-          {/* Benchmark Queries */}
-          {benchmarkMode && (
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="block text-sm font-medium text-gray-700">
-                  Benchmark Queries
-                </label>
-                <button
-                  onClick={addBenchmarkQuery}
-                  className="text-sm text-blue-600 hover:text-blue-700"
-                >
-                  Add Query
-                </button>
-              </div>
-              <div className="space-y-2">
-                {benchmarkQueries.map((q, index) => (
-                  <div key={index} className="flex space-x-2">
-                    <input
-                      type="text"
-                      value={q}
-                      onChange={(e) => updateBenchmarkQuery(index, e.target.value)}
-                      placeholder={`Query ${index + 1}...`}
-                      className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    />
-                    {benchmarkQueries.length > 1 && (
-                      <button
-                        onClick={() => removeBenchmarkQuery(index)}
-                        className="px-2 py-2 text-red-600 hover:text-red-700"
-                      >
-                        ✕
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Available Methods */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-3">
-              Search Methods
-            </label>
-            <div className="space-y-2">
-              {SEARCH_METHODS.map((method) => {
-                const isAvailable = searchMethods[method.id]?.available !== false;
-                const isSelected = selectedMethods.includes(method.id);
-                
-                return (
-                  <div
-                    key={method.id}
-                    className={`p-3 rounded-lg border cursor-pointer transition-colors ${
-                      isSelected
-                        ? 'border-blue-200 bg-blue-50'
-                        : 'border-gray-200 bg-white hover:bg-gray-50'
-                    } ${!isAvailable ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    onClick={() => isAvailable && toggleMethod(method.id)}
+                {/* Quick Action Buttons */}
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={handleAnalyzeQuery}
+                    disabled={!query.trim()}
+                    className="btn-ghost text-sm disabled:opacity-50"
                   >
-                    <div className="flex items-center space-x-3">
-                      <input
-                        type="checkbox"
-                        checked={isSelected}
-                        onChange={() => {}}
-                        disabled={!isAvailable}
-                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                      />
-                      <div className="flex-1">
-                        <div className="flex items-center space-x-2">
-                          <span className="text-lg">{method.icon}</span>
-                          <span className="font-medium text-gray-900">{method.name}</span>
+                    <DocumentTextIcon className="h-4 w-4 mr-1" />
+                    Analyze
+                  </button>
+                </div>
+
+                {/* Analysis Results */}
+                {analysisResult && (
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                    <h4 className="font-medium text-blue-900 mb-2">Query Analysis</h4>
+                    <div className="text-sm text-blue-700 space-y-1">
+                      <p>Length: {analysisResult.length} chars, {analysisResult.word_count} words</p>
+                      {analysisResult.suggestions?.length > 0 && (
+                        <div>
+                          <p className="font-medium">Suggestions:</p>
+                          <ul className="list-disc list-inside">
+                            {analysisResult.suggestions.map((suggestion, idx) => (
+                              <li key={idx}>{suggestion}</li>
+                            ))}
+                          </ul>
                         </div>
-                        <p className="text-sm text-gray-600 mt-1">{method.description}</p>
-                        {!isAvailable && (
-                          <p className="text-xs text-red-600 mt-1">
-                            {searchMethods[method.id]?.indexes?.length === 0
-                              ? 'No indexes available'
-                              : 'Not available'}
-                          </p>
-                        )}
-                      </div>
+                      )}
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          </div>
+                )}
+              </div>
+            ) : (
+              /* Benchmark Mode */
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Test Queries
+                  </label>
+                  {benchmarkQueries.map((q, index) => (
+                    <div key={index} className="flex items-center space-x-2 mb-2">
+                      <input
+                        type="text"
+                        value={q}
+                        onChange={(e) => updateBenchmarkQuery(index, e.target.value)}
+                        placeholder={`Query ${index + 1}...`}
+                        className="flex-1 input-field"
+                      />
+                      {benchmarkQueries.length > 1 && (
+                        <button
+                          onClick={() => removeBenchmarkQuery(index)}
+                          className="text-red-600 hover:text-red-800"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button
+                    onClick={addBenchmarkQuery}
+                    className="btn-ghost text-sm"
+                  >
+                    + Add Query
+                  </button>
+                </div>
+              </div>
+            )}
 
-          {/* Action Buttons */}
-          <div className="space-y-3">
-            {!benchmarkMode ? (
-              <>
+            {/* Method Selection */}
+            <div className="mt-6">
+              <label className="block text-sm font-medium text-gray-700 mb-3">
+                Search Methods
+              </label>
+              <div className="space-y-3">
+                {SEARCH_METHODS.map((method) => {
+                  const isAvailable = searchMethods[method.id]?.available;
+                  const isSelected = selectedMethods.includes(method.id);
+                  
+                  return (
+                    <div
+                      key={method.id}
+                      className={`border rounded-lg p-3 cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'border-blue-500 bg-blue-50'
+                          : 'border-gray-200 hover:border-gray-300'
+                      } ${!isAvailable ? 'opacity-50' : ''}`}
+                      onClick={() => isAvailable && toggleMethod(method.id)}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-2">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => isAvailable && toggleMethod(method.id)}
+                            disabled={!isAvailable}
+                            className="rounded"
+                          />
+                          <span className="text-lg">{method.icon}</span>
+                          <div>
+                            <p className="font-medium text-gray-900">{method.name}</p>
+                            <p className="text-sm text-gray-600">{method.description}</p>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <p className={`text-sm font-medium ${
+                            isAvailable ? 'text-green-600' : 'text-red-600'
+                          }`}>
+                            {isAvailable ? 'Available' : 'Not Available'}
+                          </p>
+                          {searchMethods[method.id]?.indexes?.length > 0 && (
+                            <p className="text-xs text-gray-500">
+                              {searchMethods[method.id].indexes.length} indexes
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="space-y-3 mt-6">
+              {!benchmarkMode ? (
+                <>
+                  <button
+                    onClick={() => handleSearch()}
+                    disabled={loading || selectedMethods.length === 0 || !query.trim()}
+                    className="w-full btn-primary disabled:opacity-50"
+                  >
+                    {loading ? (
+                      <ArrowPathIcon className="h-4 w-4 mr-2 animate-spin" />
+                    ) : (
+                      <MagnifyingGlassIcon className="h-4 w-4 mr-2" />
+                    )}
+                    Search Selected Methods
+                  </button>
+                  
+                  <button
+                    onClick={handleCompareSearch}
+                    disabled={loading || selectedMethods.length < 2 || !query.trim()}
+                    className="w-full btn-secondary disabled:opacity-50"
+                  >
+                    <ChartBarIcon className="h-4 w-4 mr-2" />
+                    Compare Methods
+                  </button>
+                </>
+              ) : (
                 <button
-                  onClick={() => handleSearch()}
-                  disabled={loading || selectedMethods.length === 0 || !query.trim()}
+                  onClick={handleBenchmark}
+                  disabled={loading || selectedMethods.length === 0 || benchmarkQueries.filter(q => q.trim()).length === 0}
                   className="w-full btn-primary disabled:opacity-50"
                 >
                   {loading ? (
                     <ArrowPathIcon className="h-4 w-4 mr-2 animate-spin" />
                   ) : (
-                    <MagnifyingGlassIcon className="h-4 w-4 mr-2" />
+                    <BeakerIcon className="h-4 w-4 mr-2" />
                   )}
-                  Search Selected Methods
+                  Run Benchmark
                 </button>
-                
-                <button
-                  onClick={handleCompareSearch}
-                  disabled={loading || selectedMethods.length < 2 || !query.trim()}
-                  className="w-full btn-secondary disabled:opacity-50"
-                >
-                  <ChartBarIcon className="h-4 w-4 mr-2" />
-                  Compare Methods
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={handleBenchmark}
-                disabled={loading || selectedMethods.length === 0 || benchmarkQueries.filter(q => q.trim()).length === 0}
-                className="w-full btn-primary disabled:opacity-50"
-              >
-                {loading ? (
-                  <ArrowPathIcon className="h-4 w-4 mr-2 animate-spin" />
-                ) : (
-                  <BeakerIcon className="h-4 w-4 mr-2" />
-                )}
-                Run Benchmark
-              </button>
-            )}
+              )}
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* Main Content Area */}
-      <div className="flex-1 flex flex-col">
-        {/* Query Analysis */}
-        {analysisResult && (
-          <div className="bg-blue-50 border-b border-blue-200 p-4">
-            <h3 className="font-medium text-blue-900 mb-2">Query Analysis</h3>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-              <div>
-                <span className="text-blue-700">Length:</span> {analysisResult.length} chars
-              </div>
-              <div>
-                <span className="text-blue-700">Words:</span> {analysisResult.word_count}
-              </div>
-              <div>
-                <span className="text-blue-700">Tables found:</span> {analysisResult.schema_matches?.tables?.length || 0}
-              </div>
-              <div>
-                <span className="text-blue-700">Columns found:</span> {analysisResult.schema_matches?.columns?.length || 0}
-              </div>
-            </div>
-            {analysisResult.suggestions?.length > 0 && (
-              <div className="mt-2">
-                <span className="text-blue-700 font-medium">Suggestions:</span>
-                <ul className="mt-1 text-sm text-blue-800">
-                  {analysisResult.suggestions.map((suggestion, index) => (
-                    <li key={index}>• {suggestion}</li>
-                  ))}
-                </ul>
+        {/* Results */}
+        <div className="lg:col-span-2">
+          <div className="bg-white border border-gray-200 rounded-lg p-6">
+            <h3 className="text-lg font-medium text-gray-900 mb-4">Results</h3>
+            
+            {loading && (
+              <div className="flex items-center justify-center py-12">
+                <LoadingSpinner size="large" />
               </div>
             )}
-          </div>
-        )}
 
-        {/* Results Area */}
-        <div className="flex-1 overflow-auto p-6">
-          {loading ? (
-            <div className="flex items-center justify-center h-64">
-              <LoadingSpinner size="large" text="Searching..." />
-            </div>
-          ) : Object.keys(searchResults).length === 0 ? (
-            <div className="text-center py-12">
-              <MagnifyingGlassIcon className="mx-auto h-12 w-12 text-gray-400" />
-              <h3 className="mt-2 text-sm font-medium text-gray-900">No search results</h3>
-              <p className="mt-1 text-sm text-gray-500">
-                {benchmarkMode
-                  ? 'Run a benchmark to see performance results'
-                  : 'Enter a query and select methods to start searching'}
-              </p>
-            </div>
-          ) : searchResults.benchmark ? (
-            <BenchmarkResults results={searchResults.benchmark} />
-          ) : (
-            <SearchResults results={searchResults} query={query} />
-          )}
+            {!loading && Object.keys(searchResults).length === 0 ? (
+              <div className="text-center py-12">
+                <MagnifyingGlassIcon className="mx-auto h-12 w-12 text-gray-400" />
+                <h3 className="mt-2 text-sm font-medium text-gray-900">No search results</h3>
+                <p className="mt-1 text-sm text-gray-500">
+                  {benchmarkMode
+                    ? 'Run a benchmark to see performance results'
+                    : 'Enter a query and select methods to start searching'}
+                </p>
+              </div>
+            ) : searchResults.benchmark ? (
+              <BenchmarkResults results={searchResults.benchmark} />
+            ) : (
+              <SearchResults results={searchResults} query={query} />
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -560,7 +599,7 @@ const SearchResults = ({ results, query }) => {
   );
 };
 
-// Method Results Component
+// Method Results Component - FIXED VERSION
 const MethodResults = ({ method, data }) => {
   const methodInfo = SEARCH_METHODS.find(m => m.id === method);
   
@@ -578,8 +617,27 @@ const MethodResults = ({ method, data }) => {
     );
   }
 
-  const results = data.results || [];
-  const isComplex = method === 'combined' && data.combined_results;
+  // Safely extract results - handle different response structures
+  let results = [];
+  let resultCount = 0;
+  let isComplex = false;
+
+  if (method === 'combined' && data.details) {
+    // For combined search, check if we have combined_results
+    if (data.details.combined_results && Array.isArray(data.details.combined_results)) {
+      results = data.details.combined_results;
+      isComplex = true;
+    } else if (Array.isArray(data.results)) {
+      results = data.results;
+    }
+  } else if (Array.isArray(data.results)) {
+    results = data.results;
+  } else if (data.results && typeof data.results === 'object') {
+    // If results is an object, try to extract an array
+    results = [];
+  }
+
+  resultCount = results.length;
 
   return (
     <div className="bg-white border border-gray-200 rounded-lg">
@@ -590,24 +648,24 @@ const MethodResults = ({ method, data }) => {
             <h4 className="font-medium text-gray-900">{methodInfo?.name || method}</h4>
           </div>
           <div className="text-sm text-gray-500">
-            {isComplex ? data.combined_results?.length : results.length} results
+            {resultCount} results
           </div>
         </div>
       </div>
 
       <div className="p-6">
         {isComplex ? (
-          <CombinedResults data={data} />
-        ) : results.length === 0 ? (
+          <CombinedResults data={data.details} />
+        ) : resultCount === 0 ? (
           <p className="text-gray-500 text-center py-4">No results found</p>
         ) : (
           <div className="space-y-3">
             {results.slice(0, 10).map((result, index) => (
               <ResultItem key={index} result={result} rank={index + 1} />
             ))}
-            {results.length > 10 && (
+            {resultCount > 10 && (
               <p className="text-sm text-gray-500 text-center pt-2">
-                ... and {results.length - 10} more results
+                ... and {resultCount - 10} more results
               </p>
             )}
           </div>
@@ -760,50 +818,53 @@ const BenchmarkResults = ({ results }) => {
       {/* Detailed Results */}
       <div className="bg-white border border-gray-200 rounded-lg">
         <div className="px-6 py-4 border-b border-gray-200">
-          <h4 className="font-medium text-gray-900">Query Results</h4>
+          <h4 className="font-medium text-gray-900">Detailed Results</h4>
         </div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Query
+                  Method
                 </th>
-                {Object.keys(performance).map((method) => (
-                  <th key={method} className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    {method}
-                  </th>
-                ))}
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Queries
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Avg Results
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Avg Time
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Success Rate
+                </th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {Object.entries(methodResults).map(([method, queries]) => {
-                if (queries.length === 0) return null;
-                
-                return queries.map((queryResult, index) => (
-                  <tr key={`${method}-${index}`} className={index === 0 ? '' : 'bg-gray-50'}>
-                    {index === 0 && (
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" rowSpan={queries.length}>
-                        {queryResult.query}
-                      </td>
-                    )}
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {queryResult.status === 'success' ? (
-                        <div className="flex items-center space-x-2">
-                          <CheckCircleIcon className="h-4 w-4 text-green-500" />
-                          <span>{queryResult.result_count} results</span>
-                          <span className="text-gray-500">({queryResult.time}s)</span>
-                        </div>
-                      ) : (
-                        <div className="flex items-center space-x-2">
-                          <ExclamationTriangleIcon className="h-4 w-4 text-red-500" />
-                          <span className="text-red-600">Error</span>
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                ));
-              })}
+              {Object.entries(methodResults).map(([method, data]) => (
+                <tr key={method}>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                    {SEARCH_METHODS.find(m => m.id === method)?.name || method}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                    {Array.isArray(data) ? data.length : 0}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                    {Array.isArray(data) ? 
+                      (data.reduce((sum, d) => sum + (d.result_count || 0), 0) / data.length).toFixed(1) : 
+                      'N/A'}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                    {performance[method]?.average_time || 'N/A'}s
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                    {performance[method] ? 
+                      (performance[method].success_rate * 100).toFixed(1) + '%' : 
+                      'N/A'}
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>

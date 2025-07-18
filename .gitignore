@@ -6,6 +6,10 @@ __pycache__/
 # claude
 claude/
 models/
+*.pkl
+*.index
+*.db
+*.xlsx
 
 # node.js dependencies
 node_modules/
