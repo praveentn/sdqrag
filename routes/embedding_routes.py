@@ -38,43 +38,6 @@ def get_project_models(project_id):
         current_app.logger.error(f"Get project models error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@embedding_bp.route('/<int:project_id>/models/download', methods=['POST'])
-def download_model(project_id):
-    """Download an embedding model"""
-    try:
-        project = Project.query.get_or_404(project_id)
-        data = request.get_json()
-        
-        if not data or not data.get('model_name'):
-            return jsonify({'error': 'Model name is required'}), 400
-        
-        model_name = data['model_name']
-        
-        # Start download in background
-        embedding_service = EmbeddingService()
-        
-        def download_task():
-            try:
-                result = embedding_service.download_model(project_id, model_name)
-                current_app.logger.info(f"Model download completed: {result}")
-            except Exception as e:
-                current_app.logger.error(f"Model download failed: {str(e)}")
-        
-        # Start download thread
-        thread = threading.Thread(target=download_task)
-        thread.daemon = True
-        thread.start()
-        
-        return jsonify({
-            'status': 'success',
-            'message': f'Model download started: {model_name}',
-            'model_name': model_name
-        }), 202
-        
-    except Exception as e:
-        current_app.logger.error(f"Download model error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
 @embedding_bp.route('/models/<int:model_id>/status', methods=['GET'])
 def get_model_status(model_id):
     """Get model download/status"""
@@ -112,114 +75,6 @@ def get_project_indexes(project_id):
         
     except Exception as e:
         current_app.logger.error(f"Get project indexes error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-@embedding_bp.route('/<int:project_id>/indexes', methods=['POST'])
-def create_index(project_id):
-    """Create a new search index"""
-    try:
-        project = Project.query.get_or_404(project_id)
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        required_fields = ['index_name', 'index_type', 'target_type']
-        for field in required_fields:
-            if not data.get(field):
-                return jsonify({'error': f'{field} is required'}), 400
-        
-        index_name = data['index_name']
-        index_type = data['index_type']
-        target_type = data['target_type']
-        target_ids = data.get('target_ids', [])
-        embedding_model_id = data.get('embedding_model_id')
-        config = data.get('config', {})
-        
-        # Validate embedding model for vector indexes
-        if index_type in ['faiss'] and not embedding_model_id:
-            return jsonify({'error': 'Embedding model is required for vector indexes'}), 400
-        
-        if embedding_model_id:
-            model = EmbeddingModel.query.get(embedding_model_id)
-            if not model or model.project_id != project_id or not model.is_downloaded:
-                return jsonify({'error': 'Invalid or unavailable embedding model'}), 400
-        
-        # Validate targets
-        if target_type == 'tables' and target_ids:
-            tables = TableInfo.query.filter(
-                TableInfo.id.in_(target_ids),
-                TableInfo.project_id == project_id
-            ).all()
-            if len(tables) != len(target_ids):
-                return jsonify({'error': 'Some target tables not found'}), 400
-        
-        # Create index record
-        search_index = SearchIndex(
-            project_id=project_id,
-            index_name=index_name,
-            index_type=index_type,
-            target_type=target_type,
-            embedding_model_id=embedding_model_id,
-            status='building',
-            build_progress=0.0,
-            is_built=False
-        )
-        search_index.set_target_ids(target_ids)
-        search_index.set_build_config(config)
-        
-        db.session.add(search_index)
-        db.session.commit()
-        
-        # Start index creation in background
-        embedding_service = EmbeddingService()
-        
-        def create_index_task():
-            try:
-                if index_type == 'faiss':
-                    result = embedding_service.create_faiss_index(
-                        project_id, embedding_model_id, index_name,
-                        target_type, target_ids, config
-                    )
-                elif index_type == 'tfidf':
-                    result = embedding_service.create_tfidf_index(
-                        project_id, index_name, target_type, target_ids, config
-                    )
-                else:
-                    result = {'status': 'error', 'message': f'Unsupported index type: {index_type}'}
-                
-                # Update index status based on result
-                if result['status'] == 'success':
-                    search_index.status = 'ready'
-                    search_index.is_built = True
-                    search_index.build_progress = 100.0
-                else:
-                    search_index.status = 'error'
-                    search_index.error_message = result.get('message', 'Unknown error')
-                
-                db.session.commit()
-                current_app.logger.info(f"Index creation completed: {result}")
-                
-            except Exception as e:
-                search_index.status = 'error'
-                search_index.error_message = str(e)
-                db.session.commit()
-                current_app.logger.error(f"Index creation failed: {str(e)}")
-        
-        # Start creation thread
-        thread = threading.Thread(target=create_index_task)
-        thread.daemon = True  # <-- COMPLETE THE MISSING LINE
-        thread.start()
-        
-        return jsonify({
-            'status': 'success',
-            'message': f'Index creation started: {index_name}',
-            'index': search_index.to_dict()
-        }), 202
-        
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"Create index error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @embedding_bp.route('/indexes/<int:index_id>/status', methods=['GET'])
@@ -315,77 +170,6 @@ def get_indexing_targets(project_id):
         current_app.logger.error(f"Get indexing targets error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@embedding_bp.route('/<int:project_id>/indexes/rebuild', methods=['POST'])
-def rebuild_indexes(project_id):
-    """Rebuild all indexes for a project"""
-    try:
-        project = Project.query.get_or_404(project_id)
-        data = request.get_json()
-        
-        index_ids = data.get('index_ids', []) if data else []
-        
-        # Get indexes to rebuild
-        if index_ids:
-            indexes = SearchIndex.query.filter(
-                SearchIndex.id.in_(index_ids),
-                SearchIndex.project_id == project_id
-            ).all()
-        else:
-            indexes = SearchIndex.query.filter_by(project_id=project_id).all()
-        
-        if not indexes:
-            return jsonify({'error': 'No indexes found to rebuild'}), 404
-        
-        # Start rebuild in background
-        embedding_service = EmbeddingService()
-        
-        def rebuild_task():
-            try:
-                for index in indexes:
-                    # Reset index status
-                    index.status = 'building'
-                    index.build_progress = 0.0
-                    index.is_built = False
-                    db.session.commit()
-                    
-                    # Rebuild based on type
-                    if index.index_type == 'faiss':
-                        result = embedding_service.create_faiss_index(
-                            index.project_id,
-                            index.embedding_model_id,
-                            index.index_name,
-                            index.target_type,
-                            index.get_target_ids(),
-                            index.get_build_config()
-                        )
-                    elif index.index_type == 'tfidf':
-                        result = embedding_service.create_tfidf_index(
-                            index.project_id,
-                            index.index_name,
-                            index.target_type,
-                            index.get_target_ids(),
-                            index.get_build_config()
-                        )
-                    
-                    current_app.logger.info(f"Index rebuild completed: {index.index_name} - {result}")
-            except Exception as e:
-                current_app.logger.error(f"Index rebuild failed: {str(e)}")
-        
-        # Start rebuild thread
-        thread = threading.Thread(target=rebuild_task)
-        thread.daemon = True
-        thread.start()
-        
-        return jsonify({
-            'status': 'success',
-            'message': f'Rebuilding {len(indexes)} indexes',
-            'rebuild_count': len(indexes)
-        }), 202
-        
-    except Exception as e:
-        current_app.logger.error(f"Rebuild indexes error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
 @embedding_bp.route('/models/<int:model_id>', methods=['DELETE'])
 def delete_model(model_id):
     """Delete an embedding model"""
@@ -453,3 +237,313 @@ def test_index_search(index_id):
     except Exception as e:
         current_app.logger.error(f"Test index search error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+
+@embedding_bp.route('/<int:project_id>/models/download', methods=['POST'])
+def download_model(project_id):
+    """Download an embedding model"""
+    try:
+        project = Project.query.get_or_404(project_id)
+        data = request.get_json()
+        
+        if not data or not data.get('model_name'):
+            return jsonify({'error': 'Model name is required'}), 400
+        
+        model_name = data['model_name']
+        
+        # Get Flask app instance BEFORE starting thread
+        app = current_app._get_current_object()
+        
+        # Start download in background with proper Flask context
+        embedding_service = EmbeddingService()
+        
+        def download_task():
+            # CRITICAL: Use the app instance to create context
+            with app.app_context():
+                try:
+                    result = embedding_service.download_model(project_id, model_name)
+                    app.logger.info(f"Model download completed: {result}")
+                except Exception as e:
+                    app.logger.error(f"Model download failed: {str(e)}")
+        
+        # Start download thread
+        thread = threading.Thread(target=download_task)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Model download started: {model_name}',
+            'model_name': model_name
+        }), 202
+        
+    except Exception as e:
+        current_app.logger.error(f"Download model error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@embedding_bp.route('/<int:project_id>/indexes', methods=['POST'])
+def create_index(project_id):
+    """Create a new search index"""
+    try:
+        project = Project.query.get_or_404(project_id)
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        required_fields = ['index_name', 'index_type', 'target_type']
+        for field in required_fields:
+            if not data.get(field):
+                return jsonify({'error': f'{field} is required'}), 400
+        
+        index_name = data['index_name']
+        index_type = data['index_type']
+        target_type = data['target_type']
+        target_ids = data.get('target_ids', [])
+        embedding_model_id = data.get('embedding_model_id')
+        config = data.get('config', {})
+        
+        # Validate embedding model for vector indexes
+        if index_type in ['faiss'] and not embedding_model_id:
+            return jsonify({'error': 'Embedding model is required for vector indexes'}), 400
+        
+        # CRITICAL: Check if model is locally downloaded and ready
+        if embedding_model_id:
+            model = EmbeddingModel.query.get(embedding_model_id)
+            if not model:
+                return jsonify({'error': 'Embedding model not found'}), 400
+            if model.project_id != project_id:
+                return jsonify({'error': 'Embedding model belongs to different project'}), 400
+            if not model.is_downloaded or model.status != 'ready':
+                return jsonify({
+                    'error': f'Embedding model is not ready. Status: {model.status}. Please ensure the model is downloaded first.'
+                }), 400
+        
+        # Validate targets
+        if target_type == 'tables' and target_ids:
+            tables = TableInfo.query.filter(
+                TableInfo.id.in_(target_ids),
+                TableInfo.project_id == project_id
+            ).all()
+            if len(tables) != len(target_ids):
+                return jsonify({'error': 'Some target tables not found'}), 400
+        
+        # Create index record
+        search_index = SearchIndex(
+            project_id=project_id,
+            index_name=index_name,
+            index_type=index_type,
+            target_type=target_type,
+            embedding_model_id=embedding_model_id,
+            status='building',
+            build_progress=0.0,
+            is_built=False
+        )
+        search_index.set_target_ids(target_ids)
+        search_index.set_build_config(config)
+        
+        db.session.add(search_index)
+        db.session.commit()
+        
+        # Get the index ID and Flask app instance BEFORE starting thread
+        index_id = search_index.id
+        app = current_app._get_current_object()
+        
+        # Start index creation in background with proper Flask context
+        embedding_service = EmbeddingService()
+        
+        def create_index_task():
+            # CRITICAL: Use the app instance to create context
+            with app.app_context():
+                try:
+                    # Get fresh instance of index within this context
+                    index = SearchIndex.query.get(index_id)
+                    if not index:
+                        app.logger.error(f"Index {index_id} not found in background task")
+                        return
+                    
+                    app.logger.info(f"Starting {index_type} index creation: {index_name}")
+                    
+                    if index_type == 'faiss':
+                        result = embedding_service.create_faiss_index(
+                            project_id, embedding_model_id, index_name,
+                            target_type, target_ids, config
+                        )
+                    elif index_type == 'tfidf':
+                        result = embedding_service.create_tfidf_index(
+                            project_id, index_name, target_type, target_ids, config
+                        )
+                    else:
+                        result = {'status': 'error', 'message': f'Unsupported index type: {index_type}'}
+                    
+                    # Update index status based on result
+                    if result['status'] == 'success':
+                        index.status = 'ready'
+                        index.is_built = True
+                        index.build_progress = 100.0
+                        app.logger.info(f"Index creation completed successfully: {index_name}")
+                    else:
+                        index.status = 'error'
+                        index.error_message = result.get('message', 'Unknown error')
+                        app.logger.error(f"Index creation failed: {index_name} - {result.get('message')}")
+                    
+                    db.session.commit()
+                    
+                except Exception as e:
+                    # Update index status on error
+                    try:
+                        index = SearchIndex.query.get(index_id)
+                        if index:
+                            index.status = 'error'
+                            index.error_message = str(e)
+                            db.session.commit()
+                    except:
+                        pass  # If we can't update status, just log
+                    app.logger.error(f"Index creation failed with exception: {str(e)}")
+        
+        # Start creation thread
+        thread = threading.Thread(target=create_index_task)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Index creation started: {index_name}',
+            'index': search_index.to_dict()
+        }), 202
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Create index error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@embedding_bp.route('/<int:project_id>/indexes/rebuild', methods=['POST'])
+def rebuild_indexes(project_id):
+    """Rebuild all indexes for a project"""
+    try:
+        project = Project.query.get_or_404(project_id)
+        data = request.get_json()
+        
+        index_ids = data.get('index_ids', []) if data else []
+        
+        # Get indexes to rebuild
+        if index_ids:
+            indexes = SearchIndex.query.filter(
+                SearchIndex.id.in_(index_ids),
+                SearchIndex.project_id == project_id
+            ).all()
+        else:
+            indexes = SearchIndex.query.filter_by(project_id=project_id).all()
+        
+        if not indexes:
+            return jsonify({'error': 'No indexes found to rebuild'}), 404
+        
+        # Get index IDs and Flask app instance BEFORE starting thread
+        rebuild_index_ids = [idx.id for idx in indexes]
+        app = current_app._get_current_object()
+        
+        # Start rebuild in background with proper Flask context
+        embedding_service = EmbeddingService()
+        
+        def rebuild_task():
+            # CRITICAL: Use the app instance to create context
+            with app.app_context():
+                try:
+                    for index_id in rebuild_index_ids:
+                        # Get fresh instance of index within this context
+                        index = SearchIndex.query.get(index_id)
+                        if not index:
+                            app.logger.warning(f"Index {index_id} not found during rebuild")
+                            continue
+                        
+                        # Check if embedding model is still available for FAISS indexes
+                        if index.index_type == 'faiss' and index.embedding_model_id:
+                            model = EmbeddingModel.query.get(index.embedding_model_id)
+                            if not model or not model.is_downloaded or model.status != 'ready':
+                                index.status = 'error'
+                                index.error_message = 'Embedding model not available for rebuild'
+                                db.session.commit()
+                                app.logger.error(f"Cannot rebuild {index.index_name}: embedding model not ready")
+                                continue
+                        
+                        # Reset index status
+                        index.status = 'building'
+                        index.build_progress = 0.0
+                        index.is_built = False
+                        db.session.commit()
+                        
+                        app.logger.info(f"Rebuilding index: {index.index_name}")
+                        
+                        # Rebuild based on type
+                        if index.index_type == 'faiss':
+                            result = embedding_service.create_faiss_index(
+                                index.project_id,
+                                index.embedding_model_id,
+                                index.index_name,
+                                index.target_type,
+                                index.get_target_ids(),
+                                index.get_build_config()
+                            )
+                        elif index.index_type == 'tfidf':
+                            result = embedding_service.create_tfidf_index(
+                                index.project_id,
+                                index.index_name,
+                                index.target_type,
+                                index.get_target_ids(),
+                                index.get_build_config()
+                            )
+                        else:
+                            result = {'status': 'error', 'message': f'Unsupported index type: {index.index_type}'}
+                        
+                        # Update index status
+                        if result['status'] == 'success':
+                            index.status = 'ready'
+                            index.is_built = True
+                            index.build_progress = 100.0
+                        else:
+                            index.status = 'error'
+                            index.error_message = result.get('message', 'Rebuild failed')
+                        
+                        db.session.commit()
+                        app.logger.info(f"Index rebuild completed: {index.index_name} - {result['status']}")
+                        
+                except Exception as e:
+                    app.logger.error(f"Index rebuild failed: {str(e)}")
+        
+        # Start rebuild thread
+        thread = threading.Thread(target=rebuild_task)
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Rebuilding {len(indexes)} indexes',
+            'rebuild_count': len(indexes)
+        }), 202
+        
+    except Exception as e:
+        current_app.logger.error(f"Rebuild indexes error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# Add endpoint to check local models status
+@embedding_bp.route('/<int:project_id>/models/local', methods=['GET'])
+def get_local_models(project_id):
+    """Get locally downloaded models for a project"""
+    try:
+        project = Project.query.get_or_404(project_id)
+        models = EmbeddingModel.query.filter_by(
+            project_id=project_id,
+            is_downloaded=True,
+            status='ready'
+        ).all()
+        
+        return jsonify({
+            'status': 'success',
+            'local_models': [model.to_dict() for model in models],
+            'count': len(models)
+        })
+        
+    except Exception as e:
+        current_app.logger.error(f"Get local models error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
