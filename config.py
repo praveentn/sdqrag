@@ -65,289 +65,246 @@ class Config:
     # AI Prompts
     PROMPTS = {
         'entity_extraction': """
-        Extract entities from the following natural language query that could map to database elements.
-        
-        Query: "{query}"
-        
-        Available database schema:
-        Tables: {tables}
-        Columns: {columns}
-        Dictionary Terms: {dictionary_terms}
-        
-        Please identify:
-        1. Table names or concepts
-        2. Column names or attributes  
-        3. Business terms or metrics
-        4. Values or filters
-        
-        Return a JSON array of entities with this format:
-        [
-            {{
-                "text": "entity text",
-                "type": "table|column|business_term|value|filter",
-                "confidence": 0.8,
-                "context": "additional context"
-            }}
-        ]
-        
-        Focus on entities that are likely to exist in the database schema.
-        """,
+Extract entities from the following natural language query that could map to database elements.
+
+Query: "{query}"
+
+Available database schema:
+Tables: {tables}
+Columns: {columns}
+Dictionary Terms: {dictionary_terms}
+
+Please identify:
+1. Table names or concepts
+2. Column names or attributes  
+3. Business terms or metrics
+4. Filter conditions or constraints
+5. Aggregation requirements
+
+Return a JSON object with an "entities" array. Each entity should have:
+- "text": the exact text from the query
+- "type": one of ["table", "column", "metric", "filter", "aggregation", "business_term"]
+- "confidence": a float between 0.0 and 1.0
+
+Example:
+{{
+  "entities": [
+    {{"text": "customers", "type": "table", "confidence": 0.9}},
+    {{"text": "revenue", "type": "metric", "confidence": 0.8}},
+    {{"text": "last month", "type": "filter", "confidence": 0.7}}
+  ]
+}}
+""",
         
         'sql_generation': """
-        Generate a SQL query based on the natural language query and entity mappings.
+Generate a SQL query based on the following information:
+
+User Query: "{query}"
+
+Extracted Entities:
+{entities}
+
+Entity Mappings:
+{mappings}
+
+Database Schema:
+{schema}
+
+Table Relationships:
+{relationships}
+
+Instructions:
+1. Generate a SELECT query only
+2. Use proper table and column names from the schema
+3. Include appropriate WHERE clauses for filters
+4. Add GROUP BY and aggregation functions as needed
+5. Use LIMIT for result size control
+6. Ensure the query is syntactically correct
+7. Round numeric results to 2-3 decimal places
+
+Return a JSON object with:
+- "sql": the complete SQL query string
+- "confidence": confidence score (0.0-1.0)
+- "explanation": brief explanation of the query logic
+
+Example:
+{{
+  "sql": "SELECT customer_name, ROUND(SUM(order_total), 2) as total_revenue FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.order_date >= DATE('now', '-30 days') GROUP BY customer_name ORDER BY total_revenue DESC LIMIT 10",
+  "confidence": 0.9,
+  "explanation": "Calculates total revenue per customer for the last 30 days, ordered by highest revenue first"
+}}
+""",
         
-        Original Query: "{query}"
+        'response_generation': """
+Generate a natural language response based on the query results.
+
+Original Query: "{query}"
+SQL Query: "{sql_query}"
+Results: {results}
+Total Results: {total_results}
+
+Instructions:
+1. Provide a clear, conversational summary of the results
+2. Highlight key insights or patterns
+3. Use natural language, not technical jargon
+4. If no results, suggest why and potential next steps
+5. If many results, summarize the top findings
+6. Include relevant numbers and statistics
+7. Be concise but informative
+
+Focus on answering the user's original question directly.
+""",
         
-        Extracted Entities: {entities}
+        'query_improvement': """
+Analyze this natural language query and suggest improvements:
+
+Query: "{query}"
+Available Tables: {tables}
+
+Provide suggestions to make the query:
+1. More specific and precise
+2. Clearer in intent
+3. Better aligned with available data
+4. More likely to return useful results
+
+Return JSON with:
+- "suggestions": array of improvement suggestions
+- "clarity_score": score from 0.0-1.0 for current clarity
+- "specificity_score": score from 0.0-1.0 for current specificity
+- "improved_query": an improved version of the query
+
+Example:
+{{
+  "suggestions": [
+    "Specify a time period for more focused results",
+    "Consider adding constraints to narrow the scope"
+  ],
+  "clarity_score": 0.7,
+  "specificity_score": 0.6,
+  "improved_query": "Show me the top 10 customers by revenue in the last quarter"
+}}
+""",
         
-        Entity to Schema Mappings: {mappings}
-        
-        Database Schema: {schema}
-        
-        Relationships: {relationships}
-        
-        Generate a valid SQL SELECT query that answers the original question.
-        Return a JSON object with this format:
-        {{
-            "sql": "SELECT statement here",
-            "explanation": "Brief explanation of the query logic",
-            "confidence": 0.8,
-            "assumptions": ["any assumptions made"]
-        }}
-        
-        Guidelines:
-        - Only use SELECT statements
-        - Use proper table and column names from the mappings
-        - Include appropriate WHERE clauses for filters
-        - Add ORDER BY if results should be sorted
-        - Use LIMIT if a specific number of results is requested
-        - Join tables when necessary based on relationships
-        """,
-        
-        'answer_generation': """
-        Generate a clear, natural language answer based on the SQL query results.
-        
-        Original Question: "{original_query}"
-        SQL Query: "{sql_query}"
-        Results: {results}
-        Total Rows: {row_count}
-        
-        Provide a concise, business-friendly answer that:
-        1. Directly answers the original question
-        2. Highlights key insights from the data
-        3. Mentions important numbers or trends
-        4. Is easy to understand for non-technical users
-        
-        Keep the response under 200 words and focus on actionable insights.
-        """,
-        
-        'dictionary_enhancement': """
-        Improve this data dictionary definition to be more clear and comprehensive.
-        
-        Term: "{term}"
-        Current Definition: "{definition}"
-        Context: This term appears in a {context_type} database with tables: {tables}
-        
-        Provide an enhanced definition that:
-        1. Is clear and concise (under 100 words)
-        2. Explains what the term represents in business context
-        3. Mentions how it relates to the data
-        4. Would be useful for data analysts and business users
-        
-        Return only the improved definition text.
-        """
-    }
-    
-    # Data Processing Configuration
-    DATA_PROCESSING = {
-        'max_sample_rows': 1000,
-        'max_sample_values_per_column': 10,
-        'data_type_inference': {
-            'numeric_threshold': 0.8,  # 80% of values must be numeric
-            'datetime_threshold': 0.8,
-            'boolean_threshold': 0.9
-        },
-        'pii_detection': {
-            'email_pattern': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-            'phone_pattern': r'(\+\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}',
-            'ssn_pattern': r'\b\d{3}-?\d{2}-?\d{4}\b'
-        }
-    }
-    
-    # Logging Configuration
-    LOGGING_CONFIG = {
-        'version': 1,
-        'disable_existing_loggers': False,
-        'formatters': {
-            'default': {
-                'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
-            }
-        },
-        'handlers': {
-            'wsgi': {
-                'class': 'logging.StreamHandler',
-                'stream': 'ext://flask.logging.wsgi_errors_stream',
-                'formatter': 'default'
-            },
-            'file': {
-                'class': 'logging.FileHandler',
-                'filename': 'logs/app.log',
-                'formatter': 'default'
-            }
-        },
-        'root': {
-            'level': 'INFO',
-            'handlers': ['wsgi', 'file']
-        }
-    }
-    
-    # Security Configuration
-    SECURITY_CONFIG = {
-        'allowed_sql_keywords': ['SELECT', 'FROM', 'WHERE', 'JOIN', 'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT'],
-        'forbidden_sql_keywords': ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE', 'TRUNCATE', 'EXEC'],
-        'max_query_length': 5000,
-        'rate_limit': {
-            'requests_per_minute': 60,
-            'requests_per_hour': 1000
-        }
-    }
-    
-    # Feature Flags
-    FEATURE_FLAGS = {
-        'enable_ai_features': True,
-        'enable_auto_dictionary': True,
-        'enable_advanced_search': True,
-        'enable_chat_interface': True,
-        'enable_admin_panel': True,
-        'enable_file_upload': True,
-        'enable_database_connections': True
-    }
-    
-    # Performance Configuration
-    PERFORMANCE_CONFIG = {
-        'max_concurrent_jobs': 5,
-        'job_timeout_seconds': 300,
-        'cache_timeout_seconds': 3600,
-        'max_search_results': 1000,
-        'pagination_size': 20
+        'intent_analysis': """
+Analyze the intent and characteristics of this query:
+
+Query: "{query}"
+
+Determine:
+1. Primary intent (lookup, aggregation, comparison, filtering, etc.)
+2. Complexity level (simple, moderate, complex)
+3. Expected result type (single value, list, table, summary)
+4. Key concepts and entities mentioned
+5. Required operations (joins, grouping, calculations)
+
+Return JSON with:
+- "intent": primary intent category
+- "complexity": complexity level
+- "result_type": expected result format
+- "concepts": array of key concepts
+- "operations": array of required database operations
+- "confidence": confidence in analysis (0.0-1.0)
+
+Example:
+{{
+  "intent": "aggregation",
+  "complexity": "moderate", 
+  "result_type": "summary_table",
+  "concepts": ["sales", "revenue", "time_period"],
+  "operations": ["join", "group_by", "sum"],
+  "confidence": 0.8
+}}
+"""
     }
 
 class DevelopmentConfig(Config):
     """Development configuration"""
     DEBUG = True
-    DEVELOPMENT = True
-    
-    # Use environment variables if available, otherwise use defaults
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DEV_DATABASE_URL') or 'sqlite:///queryforge_dev.db'
-    
-    # More verbose logging in development
-    LOGGING_CONFIG = Config.LOGGING_CONFIG.copy()
-    LOGGING_CONFIG['root']['level'] = 'DEBUG'
-    
-    # Relaxed security for development
-    SECURITY_CONFIG = Config.SECURITY_CONFIG.copy()
-    SECURITY_CONFIG['rate_limit']['requests_per_minute'] = 1000
+    TESTING = False
 
 class ProductionConfig(Config):
     """Production configuration"""
     DEBUG = False
-    DEVELOPMENT = False
+    TESTING = False
     
-    # Set defaults, validation happens in validate_production_config()
-    SECRET_KEY = os.environ.get('SECRET_KEY') or Config.SECRET_KEY
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or Config.SQLALCHEMY_DATABASE_URI
-    
-    # Enhanced security in production
-    SECURITY_CONFIG = Config.SECURITY_CONFIG.copy()
-    SECURITY_CONFIG['rate_limit']['requests_per_minute'] = 30
-    
-    # Production logging
-    LOGGING_CONFIG = Config.LOGGING_CONFIG.copy()
-    LOGGING_CONFIG['root']['level'] = 'WARNING'
-    
-    @classmethod
-    def validate_production_config(cls):
-        """Validate production configuration when actually using production"""
-        errors = []
-        
-        if not os.environ.get('SECRET_KEY'):
-            errors.append("SECRET_KEY environment variable should be set in production")
-        
-        if not os.environ.get('DATABASE_URL'):
-            errors.append("DATABASE_URL environment variable should be set in production")
-        
-        if errors:
-            import warnings
-            for error in errors:
-                warnings.warn(f"Production Warning: {error}")
-        
-        return len(errors) == 0
+    # Production-specific settings
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        'pool_size': 20,
+        'pool_timeout': 20,
+        'pool_recycle': 300,
+        'pool_pre_ping': True,
+        'max_overflow': 30
+    }
 
 class TestingConfig(Config):
     """Testing configuration"""
-    TESTING = True
     DEBUG = True
-    
-    # Use in-memory database for testing
+    TESTING = True
     SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
-    
-    # Disable AI features for faster testing
-    FEATURE_FLAGS = Config.FEATURE_FLAGS.copy()
-    FEATURE_FLAGS['enable_ai_features'] = False
-    
-    # Reduced timeouts for testing
-    PERFORMANCE_CONFIG = Config.PERFORMANCE_CONFIG.copy()
-    PERFORMANCE_CONFIG['job_timeout_seconds'] = 30
+    WTF_CSRF_ENABLED = False
 
-# Configuration mapping
-config_mapping = {
-    'development': DevelopmentConfig,
-    'production': ProductionConfig,
-    'testing': TestingConfig,
-    'default': DevelopmentConfig
-}
+def get_config():
+    """Get configuration class based on environment"""
+    env = os.environ.get('FLASK_ENV', 'development').lower()
+    
+    if env == 'production':
+        return ProductionConfig
+    elif env == 'testing':
+        return TestingConfig
+    else:
+        return DevelopmentConfig
 
-def get_config(config_name='default'):
-    """Get configuration class by name"""
-    # Determine config from environment if not specified
-    if config_name == 'default':
-        config_name = os.environ.get('FLASK_ENV', 'development').lower()
-    
-    config_class = config_mapping.get(config_name, DevelopmentConfig)
-    
-    # Validate production config if being used
-    if config_class == ProductionConfig:
-        config_class.validate_production_config()
-    
-    return config_class
-
-# Environment-specific configurations
 def init_app_config(app):
-    """Initialize app-specific configuration"""
+    """Initialize additional app configuration"""
     
     # Create required directories
-    required_dirs = [
+    directories = [
         app.config['UPLOAD_FOLDER'],
-        'logs',
-        'indexes',
-        'backups'
+        'models',
+        'indexes', 
+        'data',
+        'logs'
     ]
     
-    for directory in required_dirs:
+    for directory in directories:
         os.makedirs(directory, exist_ok=True)
     
-    # Set up logging
-    if not app.debug:
+    # Configure logging
+    if not app.debug and not app.testing:
         import logging
-        import logging.config
-        logging.config.dictConfig(app.config['LOGGING_CONFIG'])
+        from logging.handlers import RotatingFileHandler
+        
+        if not os.path.exists('logs'):
+            os.mkdir('logs')
+        
+        file_handler = RotatingFileHandler(
+            'logs/queryforge.log', 
+            maxBytes=10240000, 
+            backupCount=10
+        )
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+        ))
+        file_handler.setLevel(logging.INFO)
+        app.logger.addHandler(file_handler)
+        app.logger.setLevel(logging.INFO)
+        app.logger.info('QueryForge startup')
     
-    # Validate critical configurations
-    if app.config.get('FEATURE_FLAGS', {}).get('enable_ai_features', False):
-        llm_config = app.config.get('LLM_CONFIG', {}).get('azure', {})
-        if not llm_config.get('api_key') or llm_config.get('api_key') == 'your-azure-openai-api-key':
-            app.logger.warning("Azure OpenAI API key not configured. AI features will be disabled.")
-            app.config['FEATURE_FLAGS']['enable_ai_features'] = False
+    # Validate Azure OpenAI configuration
+    azure_config = app.config['LLM_CONFIG']['azure']
+    api_key = os.environ.get('AZURE_OPENAI_API_KEY') or azure_config.get('api_key')
+    endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT') or azure_config.get('endpoint')
+    
+    if (api_key == 'your-azure-openai-api-key' or 
+        endpoint == 'https://your-resource.openai.azure.com/'):
+        app.logger.warning(
+            "Azure OpenAI not configured. Chat functionality will be limited. "
+            "Please set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT environment variables."
+        )
+    else:
+        app.logger.info("Azure OpenAI configuration detected")
+    
+    return app
 
 # Database connection validation
 def validate_database_config(config):

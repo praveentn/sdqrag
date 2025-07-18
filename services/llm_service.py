@@ -23,6 +23,10 @@ class LLMService:
                 current_app.logger.warning("Azure OpenAI API key not configured")
                 return
             
+            if not endpoint or endpoint == 'https://your-resource.openai.azure.com/':
+                current_app.logger.warning("Azure OpenAI endpoint not configured")
+                return
+            
             self.client = AzureOpenAI(
                 api_key=api_key,
                 api_version=api_version,
@@ -50,16 +54,16 @@ class LLMService:
             tables = list(schema_context.get('tables', {}).keys())
             columns = []
             for table_schema in schema_context.get('tables', {}).values():
-                columns.extend(table_schema.get('columns', []))
+                columns.extend([col.get('name', '') for col in table_schema.get('columns', [])])
             
-            dictionary_terms = [term['term'] for term in schema_context.get('dictionary', [])]
+            dictionary_terms = [term.get('term', '') for term in schema_context.get('dictionary', [])]
             
             # Use prompt template from config
             prompt = current_app.config['PROMPTS']['entity_extraction'].format(
                 query=query,
-                tables=', '.join(tables),
-                columns=', '.join(columns),
-                dictionary_terms=', '.join(dictionary_terms)
+                tables=', '.join(tables[:20]),  # Limit to avoid token overflow
+                columns=', '.join(columns[:50]),  # Limit to avoid token overflow
+                dictionary_terms=', '.join(dictionary_terms[:30])  # Limit to avoid token overflow
             )
             
             response = self.client.chat.completions.create(
@@ -91,7 +95,7 @@ class LLMService:
             current_app.logger.error(f"Entity extraction error: {str(e)}")
             return {"error": str(e), "entities": []}
     
-    def generate_sql(self, query: str, entities: List[Dict], mappings: Dict[str, Any], 
+    def generate_sql(self, query: str, entities: List[Dict], mappings: List[Dict], 
                      schema: Dict[str, Any], relationships: List[Dict] = None) -> Dict[str, Any]:
         """Generate SQL query from natural language query and context"""
         if not self.is_available():
@@ -121,17 +125,25 @@ class LLMService:
             content = response.choices[0].message.content
             result = json.loads(content)
             
-            # Validate SQL security
-            sql = result.get('sql', '')
-            if self._validate_sql_security(sql):
-                return result
-            else:
-                return {
-                    "error": "Generated SQL contains forbidden operations",
-                    "sql": "",
-                    "confidence": 0.0
-                }
-                
+            # Validate the response
+            if 'sql' not in result:
+                return {"error": "LLM did not generate SQL", "sql": "", "confidence": 0.0}
+            
+            sql_query = result.get('sql', '').strip()
+            if not sql_query:
+                return {"error": "Empty SQL query generated", "sql": "", "confidence": 0.0}
+            
+            # Basic SQL validation
+            if not sql_query.lower().startswith('select'):
+                return {"error": "Generated query is not a SELECT statement", "sql": "", "confidence": 0.0}
+            
+            return {
+                "sql": sql_query,
+                "confidence": result.get('confidence', 0.8),
+                "explanation": result.get('explanation', ''),
+                "raw_response": content
+            }
+            
         except json.JSONDecodeError as e:
             current_app.logger.error(f"JSON parsing error in SQL generation: {str(e)}")
             return {"error": "Failed to parse LLM response", "sql": "", "confidence": 0.0}
@@ -139,123 +151,183 @@ class LLMService:
             current_app.logger.error(f"SQL generation error: {str(e)}")
             return {"error": str(e), "sql": "", "confidence": 0.0}
     
-    def generate_answer(self, original_query: str, sql_query: str, results: List[Dict], 
-                       row_count: int) -> str:
-        """Generate natural language answer from SQL results"""
+    def generate_final_response(self, query: str, sql_query: str, results: List[Dict]) -> Dict[str, Any]:
+        """Generate natural language response from query results"""
         if not self.is_available():
-            return "LLM service not available. Please configure Azure OpenAI."
+            # Fallback response when LLM is not available
+            if results:
+                return {
+                    "response": f"Found {len(results)} results for your query. The data shows the requested information from your database.",
+                    "confidence": 0.5
+                }
+            else:
+                return {
+                    "response": "No results found for your query. You may want to try rephrasing your question or checking if the data exists.",
+                    "confidence": 0.5
+                }
         
         try:
-            # Limit results for prompt to avoid token limits
-            limited_results = results[:20] if len(results) > 20 else results
+            # Limit results for context (to avoid token overflow)
+            sample_results = results[:5] if len(results) > 5 else results
             
-            prompt = current_app.config['PROMPTS']['answer_generation'].format(
-                original_query=original_query,
+            # Use prompt template from config
+            prompt = current_app.config['PROMPTS']['response_generation'].format(
+                query=query,
                 sql_query=sql_query,
-                results=json.dumps(limited_results, indent=2),
-                row_count=row_count
+                results=json.dumps(sample_results, indent=2),
+                total_results=len(results)
             )
             
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are a business analyst. Provide clear, concise answers based on data results."},
+                    {"role": "system", "content": "You are a helpful data analyst. Provide clear, concise answers based on query results."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=800,
-                temperature=0.2
+                max_tokens=self.config.get('max_tokens', 1000),
+                temperature=self.config.get('temperature', 0.1)
             )
             
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content.strip()
+            
+            return {
+                "response": content,
+                "confidence": 0.9,
+                "raw_response": content
+            }
             
         except Exception as e:
-            current_app.logger.error(f"Answer generation error: {str(e)}")
-            return f"Error generating response: {str(e)}"
+            current_app.logger.error(f"Final response generation error: {str(e)}")
+            
+            # Fallback response
+            if results:
+                return {
+                    "response": f"Found {len(results)} results for your query. The data shows the requested information from your database.",
+                    "confidence": 0.5,
+                    "error": str(e)
+                }
+            else:
+                return {
+                    "response": "No results found for your query. You may want to try rephrasing your question or checking if the data exists.",
+                    "confidence": 0.5,
+                    "error": str(e)
+                }
     
-    def enhance_dictionary_definition(self, term: str, definition: str, context_type: str, 
-                                    tables: List[str]) -> str:
-        """Enhance data dictionary definition using LLM"""
+    def analyze_query_intent(self, query: str) -> Dict[str, Any]:
+        """Analyze the intent and complexity of a natural language query"""
         if not self.is_available():
-            return definition  # Return original if LLM not available
+            return {"error": "LLM service not available", "intent": "unknown"}
         
         try:
-            prompt = current_app.config['PROMPTS']['dictionary_enhancement'].format(
-                term=term,
-                definition=definition,
-                context_type=context_type,
-                tables=', '.join(tables)
-            )
+            prompt = f"""
+            Analyze the following query and determine:
+            1. The main intent (aggregation, filtering, lookup, comparison, etc.)
+            2. Complexity level (simple, moderate, complex)
+            3. Expected result type (single value, list, table, summary)
+            4. Key concepts mentioned
+            
+            Query: "{query}"
+            
+            Return a JSON object with: intent, complexity, result_type, concepts, confidence
+            """
             
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are a data documentation expert. Improve data dictionary definitions."},
+                    {"role": "system", "content": "You are an expert at analyzing data queries. Return valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=500,
-                temperature=0.3
+                temperature=0.1,
+                response_format={"type": "json_object"}
             )
             
-            enhanced_definition = response.choices[0].message.content.strip()
-            return enhanced_definition if enhanced_definition else definition
+            content = response.choices[0].message.content
+            result = json.loads(content)
+            
+            return result
             
         except Exception as e:
-            current_app.logger.error(f"Dictionary enhancement error: {str(e)}")
-            return definition
+            current_app.logger.error(f"Query intent analysis error: {str(e)}")
+            return {"error": str(e), "intent": "unknown"}
     
-    def _validate_sql_security(self, sql: str) -> bool:
-        """Validate SQL query for security"""
-        if not sql:
-            return False
+    def suggest_query_improvements(self, query: str, schema_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Suggest improvements to a natural language query"""
+        if not self.is_available():
+            return {"error": "LLM service not available", "suggestions": []}
         
-        sql_upper = sql.upper().strip()
-        
-        # Check for forbidden keywords
-        forbidden_keywords = current_app.config['SECURITY_CONFIG']['forbidden_sql_keywords']
-        for keyword in forbidden_keywords:
-            if keyword in sql_upper:
-                return False
-        
-        # Must start with SELECT
-        if not sql_upper.startswith('SELECT'):
-            return False
-        
-        # Check length
-        max_length = current_app.config['SECURITY_CONFIG']['max_query_length']
-        if len(sql) > max_length:
-            return False
-        
-        return True
+        try:
+            tables = list(schema_context.get('tables', {}).keys())
+            
+            prompt = f"""
+            Given this database schema with tables: {', '.join(tables[:10])}
+            
+            Analyze this query and suggest improvements:
+            "{query}"
+            
+            Consider:
+            1. Clarity and specificity
+            2. Use of proper terminology
+            3. Missing context or constraints
+            4. Potential ambiguities
+            
+            Return JSON with: suggestions (list), clarity_score (0-1), specificity_score (0-1)
+            """
+            
+            response = self.client.chat.completions.create(
+                model=self.deployment_name,
+                messages=[
+                    {"role": "system", "content": "You are an expert at improving data queries. Return valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            
+            content = response.choices[0].message.content
+            result = json.loads(content)
+            
+            return result
+            
+        except Exception as e:
+            current_app.logger.error(f"Query improvement suggestion error: {str(e)}")
+            return {"error": str(e), "suggestions": []}
     
     def test_connection(self) -> Dict[str, Any]:
-        """Test Azure OpenAI connection"""
+        """Test the LLM service connection"""
         if not self.is_available():
             return {
                 "status": "error",
-                "message": "Azure OpenAI client not initialized",
-                "details": "Check API key and endpoint configuration"
+                "message": "LLM service not initialized",
+                "available": False
             }
         
         try:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "user", "content": "Say 'Connection test successful' if you can see this message."}
+                    {"role": "user", "content": "Return a simple JSON object with message: 'test successful'"}
                 ],
                 max_tokens=50,
-                temperature=0
+                temperature=0.1,
+                response_format={"type": "json_object"}
             )
+            
+            content = response.choices[0].message.content
+            result = json.loads(content)
             
             return {
                 "status": "success",
-                "message": "Azure OpenAI connection successful",
-                "response": response.choices[0].message.content,
-                "model": self.deployment_name
+                "message": "LLM service connection successful",
+                "available": True,
+                "test_response": result
             }
             
         except Exception as e:
+            current_app.logger.error(f"LLM connection test error: {str(e)}")
             return {
                 "status": "error",
-                "message": f"Connection test failed: {str(e)}",
-                "details": "Check API key, endpoint, and deployment name"
+                "message": f"LLM service connection failed: {str(e)}",
+                "available": False
             }

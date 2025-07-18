@@ -6,8 +6,30 @@ from services.search_service import SearchService
 from datetime import datetime
 import uuid
 import time
+import traceback
 
 chat_bp = Blueprint('chat', __name__)
+
+@chat_bp.route('/<int:project_id>/llm-status', methods=['GET'])
+def check_llm_status(project_id):
+    """Check if LLM service is available"""
+    try:
+        llm_service = LLMService()
+        is_available = llm_service.is_available()
+        
+        return jsonify({
+            'status': 'success',
+            'available': is_available,
+            'message': 'LLM service available' if is_available else 'LLM service not configured'
+        })
+        
+    except Exception as e:
+        current_app.logger.error(f"LLM status check error: {str(e)}")
+        return jsonify({
+            'status': 'success',
+            'available': False,
+            'message': f'LLM service error: {str(e)}'
+        })
 
 @chat_bp.route('/<int:project_id>/sessions', methods=['GET'])
 def get_chat_sessions(project_id):
@@ -34,13 +56,13 @@ def get_chat_sessions(project_id):
             
             session_list.append({
                 'session_id': session.session_id,
-                'last_activity': session.last_activity.isoformat(),
+                'last_activity': session.last_activity.isoformat() if session.last_activity else None,
                 'query_count': session.query_count,
                 'first_query': first_chat.user_query[:100] + '...' if first_chat and len(first_chat.user_query) > 100 else first_chat.user_query if first_chat else ''
             })
         
         # Sort by last activity
-        session_list.sort(key=lambda x: x['last_activity'], reverse=True)
+        session_list.sort(key=lambda x: x['last_activity'] or '', reverse=True)
         
         return jsonify({
             'status': 'success',
@@ -146,6 +168,7 @@ def process_natural_language_query(project_id):
         
     except Exception as e:
         current_app.logger.error(f"Process NL query error: {str(e)}")
+        current_app.logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 def _extract_entities_step(project_id, query, chat):
@@ -160,7 +183,7 @@ def _extract_entities_step(project_id, query, chat):
         if not llm_service.is_available():
             return {
                 'status': 'error',
-                'message': 'LLM service not available'
+                'message': 'LLM service not available. Please configure Azure OpenAI settings.'
             }
         
         entity_result = llm_service.extract_entities(query, schema_context)
@@ -175,6 +198,12 @@ def _extract_entities_step(project_id, query, chat):
             }
         
         entities = entity_result.get('entities', [])
+        
+        if not entities:
+            return {
+                'status': 'error',
+                'message': 'No entities found in the query. Please try rephrasing your question.'
+            }
         
         # Save entities
         chat.set_extracted_entities(entities)
@@ -200,6 +229,7 @@ def _extract_entities_step(project_id, query, chat):
         
     except Exception as e:
         current_app.logger.error(f"Extract entities step error: {str(e)}")
+        current_app.logger.error(traceback.format_exc())
         chat.status = 'error'
         chat.error_message = str(e)
         db.session.commit()
@@ -249,37 +279,34 @@ def _confirm_entities_step(project_id, query, chat, confirmation_data):
         return {'status': 'error', 'message': str(e)}
 
 def _confirm_mappings_step(project_id, query, chat, confirmation_data):
-    """Step 3: Confirm mappings and select tables"""
+    """Step 3: Confirm mappings and prepare for SQL generation"""
     try:
-        selected_mappings = confirmation_data.get('selected_mappings', [])
+        confirmed_mappings = confirmation_data.get('confirmed_mappings', [])
         
-        if not selected_mappings:
+        if not confirmed_mappings:
             return {
                 'status': 'error',
-                'message': 'No mappings selected'
+                'message': 'No mappings confirmed'
             }
         
-        # Extract table information from mappings
+        # Extract table IDs from mappings
         table_ids = set()
-        for mapping in selected_mappings:
+        for mapping in confirmed_mappings:
             if mapping.get('type') == 'table':
                 table_ids.add(mapping.get('id'))
             elif mapping.get('type') == 'column':
                 table_ids.add(mapping.get('table_id'))
         
-        # Get detailed table schemas
+        # Get detailed schema context
         search_service = SearchService()
         schema_context = search_service.get_table_schema_context(project_id, list(table_ids))
         
-        # Save selected tables
-        chat.set_selected_tables(list(schema_context['tables'].keys()))
-        
-        # Set confirmation step
+        # Update confirmation step
         confirmation_steps = {
             'current_step': 'generate_sql',
             'next_step': 'execute_sql',
-            'selected_mappings': selected_mappings,
-            'selected_tables': list(schema_context['tables'].keys()),
+            'confirmed_mappings': confirmed_mappings,
+            'selected_mappings': confirmed_mappings,
             'schema_context': schema_context
         }
         chat.set_confirmation_steps(confirmation_steps)
@@ -290,10 +317,9 @@ def _confirm_mappings_step(project_id, query, chat, confirmation_data):
             'status': 'success',
             'step': 'generate_sql',
             'session_id': chat.session_id,
-            'selected_mappings': selected_mappings,
-            'selected_tables': list(schema_context['tables'].keys()),
+            'confirmed_mappings': confirmed_mappings,
             'schema_context': schema_context,
-            'message': 'Tables selected. Ready to generate SQL query.',
+            'message': 'Mappings confirmed. Ready to generate SQL query.',
             'next_action': 'User should confirm to generate SQL'
         }
         
@@ -348,7 +374,7 @@ def _generate_sql_step(project_id, query, chat, confirmation_data):
             'generated_sql': generated_sql,
             'sql_metadata': sql_result,
             'message': 'SQL query generated. Please review and confirm execution.',
-            'next_action': 'User should review SQL and confirm execution'
+            'next_action': 'User should confirm SQL execution'
         }
         
     except Exception as e:
@@ -356,8 +382,9 @@ def _generate_sql_step(project_id, query, chat, confirmation_data):
         return {'status': 'error', 'message': str(e)}
 
 def _execute_sql_step(project_id, query, chat, confirmation_data):
-    """Step 5: Execute SQL"""
+    """Step 5: Execute SQL and generate final response"""
     try:
+        # Get SQL from chat
         sql_query = chat.generated_sql
         
         if not sql_query:
@@ -368,37 +395,33 @@ def _execute_sql_step(project_id, query, chat, confirmation_data):
         
         # Execute SQL
         search_service = SearchService()
-        execution_result = search_service.execute_sql_query(project_id, sql_query)
+        sql_result = search_service.execute_sql_query(project_id, sql_query)
         
-        if execution_result['status'] != 'success':
+        if 'error' in sql_result:
             chat.status = 'error'
-            chat.error_message = execution_result['message']
+            chat.error_message = sql_result['error']
             db.session.commit()
-            return execution_result
-        
-        results = execution_result['results']
+            return {
+                'status': 'error',
+                'message': sql_result['error']
+            }
         
         # Save SQL results
-        chat.set_sql_results(results)
+        chat.set_sql_results(sql_result['data'])
         
-        # Generate natural language answer
+        # Generate final response using LLM
         llm_service = LLMService()
         if llm_service.is_available():
-            final_response = llm_service.generate_answer(
-                query, sql_query, results, len(results)
+            final_response_result = llm_service.generate_final_response(
+                query, sql_query, sql_result['data']
             )
+            final_response = final_response_result.get('response', 'Query completed successfully.')
         else:
-            final_response = f"Query executed successfully. Found {len(results)} results."
+            final_response = f"Found {len(sql_result['data'])} results for your query."
         
+        # Update chat record
         chat.final_response = final_response
         chat.status = 'completed'
-        
-        # Update confirmation step
-        confirmation_steps = chat.get_confirmation_steps()
-        confirmation_steps['current_step'] = 'completed'
-        confirmation_steps['execution_result'] = execution_result
-        confirmation_steps['final_response'] = final_response
-        chat.set_confirmation_steps(confirmation_steps)
         
         db.session.commit()
         
@@ -407,10 +430,10 @@ def _execute_sql_step(project_id, query, chat, confirmation_data):
             'step': 'completed',
             'session_id': chat.session_id,
             'sql_query': sql_query,
-            'results': results,
-            'result_count': len(results),
+            'results': sql_result['data'],
+            'result_count': len(sql_result['data']),
             'final_response': final_response,
-            'message': 'Query executed successfully!',
+            'message': 'Query completed successfully.',
             'next_action': 'User can provide feedback or ask a new question'
         }
         
@@ -514,6 +537,8 @@ def delete_chat_session(project_id, session_id):
 def quick_query(project_id):
     """Quick query without step-by-step confirmation (for testing)"""
     try:
+        from sqlalchemy import text
+
         project = Project.query.get_or_404(project_id)
         data = request.get_json()
         
@@ -544,12 +569,24 @@ def quick_query(project_id):
             search_service = SearchService()
             llm_service = LLMService()
             
+            # Check LLM availability
+            if not llm_service.is_available():
+                raise Exception("LLM service not available. Please configure Azure OpenAI settings.")
+            
             # Get schema context
             schema_context = search_service.get_table_schema_context(project_id)
+            current_app.logger.info(f"Schema context tables: {list(schema_context.get('tables', {}).keys())}")
             
             # Extract entities
             entity_result = llm_service.extract_entities(query, schema_context)
+            if 'error' in entity_result:
+                raise Exception(f"Entity extraction failed: {entity_result['error']}")
+                
             entities = entity_result.get('entities', [])
+            if not entities:
+                raise Exception("No entities found in the query. Please try rephrasing your question.")
+            
+            current_app.logger.info(f"Extracted entities: {entities}")
             chat.set_extracted_entities(entities)
             
             # Search for mappings
@@ -559,9 +596,19 @@ def quick_query(project_id):
             # Use top mappings automatically
             combined_results = mapping_results.get('combined_results', [])
             if not combined_results:
-                raise Exception("No entity mappings found")
+                # If no combined results, try using any available mappings
+                all_mappings = []
+                for method_results in mapping_results.values():
+                    if isinstance(method_results, list):
+                        all_mappings.extend(method_results)
+                
+                if not all_mappings:
+                    raise Exception("No entity mappings found. Please ensure your data is properly indexed.")
+                
+                combined_results = all_mappings[:5]
             
             top_mappings = combined_results[:5]  # Use top 5 mappings
+            current_app.logger.info(f"Top mappings: {[m.get('name') or m.get('table_name') for m in top_mappings]}")
             
             # Extract table IDs
             table_ids = set()
@@ -573,55 +620,185 @@ def quick_query(project_id):
             
             # Get detailed schema
             detailed_schema = search_service.get_table_schema_context(project_id, list(table_ids))
+            current_app.logger.info(f"Detailed schema tables: {list(detailed_schema.get('tables', {}).keys())}")
             
             # Generate SQL
             sql_result = llm_service.generate_sql(query, entities, top_mappings, detailed_schema)
-            
             if 'error' in sql_result:
-                raise Exception(sql_result['error'])
+                raise Exception(f"SQL generation failed: {sql_result['error']}")
             
-            sql_query = sql_result.get('sql', '')
-            chat.generated_sql = sql_query
+            generated_sql = sql_result.get('sql', '')
+            current_app.logger.info(f"Generated SQL for query '{query}': {generated_sql}")
             
-            # Execute SQL
-            execution_result = search_service.execute_sql_query(project_id, sql_query)
+            chat.generated_sql = generated_sql
             
-            if execution_result['status'] != 'success':
-                raise Exception(execution_result['message'])
+            # Execute SQL with enhanced error handling
+            execution_result = search_service.execute_sql_query(project_id, generated_sql)
+            if 'error' in execution_result:
+                current_app.logger.error(f"SQL execution failed. SQL: {generated_sql}")
+                current_app.logger.error(f"Error: {execution_result['error']}")
+                
+                # Try to suggest corrections if it's a table name issue
+                if 'no such table' in execution_result['error'].lower():
+                    try:
+                        # Get actual table names from database
+                        actual_tables_result = db.session.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+                        actual_table_names = [row[0] for row in actual_tables_result]
+                        current_app.logger.error(f"Available tables in database: {actual_table_names}")
+                        
+                        # Try to find a similar table name
+                        import difflib
+                        table_mentioned = execution_result['error'].split('no such table: ')[-1].strip()
+                        similar_tables = difflib.get_close_matches(table_mentioned, actual_table_names, n=3, cutoff=0.4)
+                        if similar_tables:
+                            current_app.logger.info(f"Similar table names found: {similar_tables}")
+                            
+                            # Try correcting the SQL with the most similar table name
+                            corrected_sql = generated_sql.replace(table_mentioned, similar_tables[0])
+                            current_app.logger.info(f"Trying corrected SQL: {corrected_sql}")
+                            
+                            corrected_result = search_service.execute_sql_query(project_id, corrected_sql)
+                            if corrected_result.get('status') == 'success':
+                                current_app.logger.info("Corrected SQL worked!")
+                                execution_result = corrected_result
+                                generated_sql = corrected_sql
+                                chat.generated_sql = corrected_sql
+                        else:
+                            # If no similar tables, try using the first available table
+                            if actual_table_names:
+                                fallback_sql = f"SELECT * FROM {actual_table_names[0]} LIMIT 10"
+                                current_app.logger.info(f"Trying fallback SQL: {fallback_sql}")
+                                fallback_result = search_service.execute_sql_query(project_id, fallback_sql)
+                                if fallback_result.get('status') == 'success':
+                                    execution_result = fallback_result
+                                    generated_sql = fallback_sql
+                                    chat.generated_sql = fallback_sql
+                    except Exception as table_correction_error:
+                        current_app.logger.error(f"Table correction attempt failed: {table_correction_error}")
+                
+                if 'error' in execution_result:
+                    raise Exception(f"SQL execution failed: {execution_result['error']}")
             
-            results = execution_result['results']
-            chat.set_sql_results(results)
+            results_data = execution_result['data']
+            chat.set_sql_results(results_data)
             
-            # Generate response
-            final_response = llm_service.generate_answer(query, sql_query, results, len(results))
+            # Generate final response
+            final_response_result = llm_service.generate_final_response(
+                query, generated_sql, results_data
+            )
+            final_response = final_response_result.get('response', 'Query completed successfully.')
+            
+            # Update chat record
             chat.final_response = final_response
             chat.status = 'completed'
-            
-            # Update processing time
-            processing_time = time.time() - start_time
-            chat.processing_time = processing_time
-            
+            chat.processing_time = time.time() - start_time
             db.session.commit()
             
             return jsonify({
                 'status': 'success',
                 'session_id': session_id,
-                'query': query,
-                'entities': entities,
-                'sql_query': sql_query,
-                'results': results,
-                'result_count': len(results),
+                'sql_query': generated_sql,
+                'results': results_data,
+                'result_count': len(results_data),
                 'final_response': final_response,
-                'processing_time': round(processing_time, 3)
+                'processing_time': round(chat.processing_time, 3),
+                'entities_extracted': len(entities),
+                'mappings_found': len(combined_results),
+                'debug_info': {
+                    'available_tables': list(detailed_schema.get('tables', {}).keys()),
+                    'sql_confidence': sql_result.get('confidence', 0)
+                }
             })
             
         except Exception as e:
+            # Update chat with error
             chat.status = 'error'
             chat.error_message = str(e)
             chat.processing_time = time.time() - start_time
             db.session.commit()
-            raise e
+            
+            current_app.logger.error(f"Quick query error: {str(e)}")
+            current_app.logger.error(traceback.format_exc())
+            return jsonify({'error': str(e)}), 500
+            
+    except Exception as e:
+        current_app.logger.error(f"Quick query setup error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@chat_bp.route('/<int:project_id>/debug-db', methods=['GET'])
+def debug_database_info(project_id):
+    """Debug endpoint to check database configuration"""
+    try:
+        import os
+        from services.search_service import SearchService
+        from sqlalchemy import text
+
+        search_service = SearchService()
+        
+        # Get database URI and current directory info
+        db_uri = current_app.config.get('SQLALCHEMY_DATABASE_URI', '')
+        current_dir = os.getcwd()
+        
+        # List all .db files in current directory and subdirectories
+        db_files = []
+        for root, dirs, files in os.walk(current_dir):
+            for file in files:
+                if file.endswith('.db'):
+                    full_path = os.path.join(root, file)
+                    size = os.path.getsize(full_path)
+                    db_files.append({
+                        'path': full_path,
+                        'size_mb': round(size / (1024*1024), 2),
+                        'relative_path': os.path.relpath(full_path, current_dir)
+                    })
+        
+        # Test SQLAlchemy connection
+        sqlalchemy_test = False
+        table_count = 0
+        try:
+            with current_app.app_context():
+                result = db.session.execute('SELECT COUNT(*) FROM sqlite_master WHERE type="table"')
+                table_count = result.scalar()
+                sqlalchemy_test = True
+        except Exception as e:
+            sqlalchemy_error = str(e)
+        
+        # Test direct file access to the resolved database path
+        resolved_path = None
+        if db_uri.startswith('sqlite:///'):
+            resolved_path = db_uri.replace('sqlite:///', '')
+        elif db_uri.startswith('sqlite://'):
+            resolved_path = db_uri.replace('sqlite://', '')
+        
+        if resolved_path and not os.path.isabs(resolved_path):
+            resolved_path = os.path.abspath(resolved_path)
+        
+        # Check project tables
+        project_tables = []
+        try:
+            from models import TableInfo
+            tables = TableInfo.query.filter_by(project_id=project_id).all()
+            project_tables = [{'id': t.id, 'name': t.table_name, 'row_count': t.row_count} for t in tables]
+        except Exception as e:
+            project_tables_error = str(e)
+        
+        return jsonify({
+            'status': 'success',
+            'debug_info': {
+                'database_uri': db_uri,
+                'current_directory': current_dir,
+                'resolved_db_path': resolved_path,
+                'resolved_path_exists': os.path.exists(resolved_path) if resolved_path else False,
+                'db_files_found': db_files,
+                'sqlalchemy_connection_works': sqlalchemy_test,
+                'table_count_in_db': table_count,
+                'project_tables': project_tables,
+                'project_id': project_id
+            }
+        })
         
     except Exception as e:
-        current_app.logger.error(f"Quick query error: {str(e)}")
+        current_app.logger.error(f"Debug database info error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+

@@ -557,9 +557,10 @@ class SearchService:
             return {'tables': {}, 'relationships': [], 'dictionary': []}
 
     def execute_sql_query(self, project_id: int, sql_query: str, 
-                         limit: int = 100) -> Dict[str, Any]:
+                        limit: int = 100) -> Dict[str, Any]:
         """Execute SQL query on project data"""
         try:
+            import os
             # Security validation
             sql_lower = sql_query.lower().strip()
             
@@ -572,12 +573,106 @@ class SearchService:
             if any(keyword in sql_lower for keyword in dangerous_keywords):
                 return {'error': 'Dangerous SQL operations are not allowed'}
             
-            # Get project database path
-            db_path = self._get_project_db_path(project_id)
-            if not os.path.exists(db_path):
-                return {'error': 'Project database not found'}
+            # Get the main application database path with better error handling
+            db_uri = current_app.config.get('SQLALCHEMY_DATABASE_URI', '')
+            current_app.logger.info(f"Database URI: {db_uri}")
             
-            # Execute query
+            db_path = None
+            
+            # Handle different SQLite URI formats
+            # if db_uri.startswith('sqlite:///'):
+            #     db_path = db_uri.replace('sqlite:///', '')
+            # elif db_uri.startswith('sqlite://'):
+            #     db_path = db_uri.replace('sqlite://', '')
+            # elif db_uri.startswith('sqlite:'):
+            #     db_path = db_uri.replace('sqlite:', '')
+            # else:
+            # Fallback: try common database names
+            possible_paths = [
+                # 'instance/queryforge.db',
+                # os.path.join(os.getcwd(), 'instance/queryforge.db'), 
+                # os.path.join(os.getcwd(), 'instance', 'queryforge.db'),
+                os.path.join(os.getcwd(), 'uploads', f'project_{project_id}.db'),
+                # os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'queryforge.db')
+            ]
+
+            for path in possible_paths:
+                abs_path = os.path.abspath(path)
+                current_app.logger.info(f"Checking database path: {abs_path}")
+                if os.path.exists(abs_path):
+                    db_path = abs_path
+                    break
+            
+            if not db_path:
+                return {'error': f'Could not locate database. URI: {db_uri}, Checked paths: {possible_paths}'}
+        
+            # Make path absolute if it's relative
+            if db_path and not os.path.isabs(db_path):
+                db_path = os.path.abspath(db_path)
+            
+            current_app.logger.info(f"Final database path: {db_path}")
+            
+            # Check if database file exists
+            if not db_path or not os.path.exists(db_path):
+                # Additional debugging - list files in current directory
+                current_dir = os.getcwd()
+                files_in_dir = [f for f in os.listdir(current_dir) if f.endswith('.db')]
+                
+                return {
+                    'error': f'Database file not found at: {db_path}. Current directory: {current_dir}. DB files found: {files_in_dir}. URI was: {db_uri}'
+                }
+            
+            # Try to access the database using SQLAlchemy's connection first
+            try:
+                # Use the Flask app's database connection
+                with current_app.app_context():
+                    # Use db.session to execute raw SQL
+                    from sqlalchemy import text
+                    
+                    # Add LIMIT if not present
+                    # if 'limit' not in sql_lower:
+                    #     sql_query = f"{sql_query.rstrip(';')} LIMIT {limit}"
+                    # sql_query += ";"
+                    # sql_query = """SELECT 
+                    #                     description, 
+                    #                     ROUND(estimated_monthly_cost, 3) as monthly_cost 
+                    #                 FROM azure_components_sheet1 
+                    #                 WHERE service_category = 'DevOps' 
+                    #                 LIMIT 10"""
+                    print(f"Executing SQLAlchemy query: {sql_query}")
+                    # Execute query using SQLAlchemy
+                    result = db.session.execute(text(sql_query))
+                    rows = result.fetchall()
+                    
+                    # Get column names
+                    columns = list(result.keys()) if rows else []
+                    
+                    # Convert to list of dicts
+                    results = []
+                    for row in rows:
+                        # Convert Row object to dict
+                        row_dict = {}
+                        for i, col in enumerate(columns):
+                            row_dict[col] = row[i] if i < len(row) else None
+                        results.append(row_dict)
+                    
+                    return {
+                        'status': 'success',
+                        'data': results,
+                        'row_count': len(results),
+                        'columns': columns,
+                        'query': sql_query,
+                        'method': 'sqlalchemy'
+                    }
+                    
+            except Exception as sqlalchemy_error:
+                current_app.logger.warning(f"SQLAlchemy execution failed: {sqlalchemy_error}")
+                # Fall back to direct SQLite connection
+                pass
+            
+            # Fallback: Direct SQLite connection
+            current_app.logger.info(f"Using direct SQLite connection to: {db_path}")
+            
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row  # This enables column access by name
             cursor = conn.cursor()
@@ -586,11 +681,13 @@ class SearchService:
             if 'limit' not in sql_lower:
                 sql_query = f"{sql_query.rstrip(';')} LIMIT {limit}"
             
+            # Execute the query
             cursor.execute(sql_query)
             rows = cursor.fetchall()
             
             # Convert to list of dicts
             results = []
+            columns = []
             if rows:
                 columns = [description[0] for description in cursor.description]
                 for row in rows:
@@ -602,12 +699,51 @@ class SearchService:
                 'status': 'success',
                 'data': results,
                 'row_count': len(results),
-                'columns': columns if rows else [],
-                'query': sql_query
+                'columns': columns,
+                'query': sql_query,
+                'method': 'sqlite'
             }
             
+        except sqlite3.Error as e:
+            current_app.logger.error(f"SQL execution error: {str(e)}")
+            return {'error': f'SQL error: {str(e)}'}
         except Exception as e:
             current_app.logger.error(f"SQL execution error: {str(e)}")
+            import traceback
+            current_app.logger.error(traceback.format_exc())
+            return {'error': str(e)}
+
+
+    def debug_database_info(self) -> Dict[str, Any]:
+        """Debug method to check database information"""
+        try:
+            db_uri = current_app.config.get('SQLALCHEMY_DATABASE_URI', '')
+            current_dir = os.getcwd()
+            
+            # List all .db files in current directory and subdirectories
+            db_files = []
+            for root, dirs, files in os.walk(current_dir):
+                for file in files:
+                    if file.endswith('.db'):
+                        db_files.append(os.path.join(root, file))
+            
+            # Check if we can connect to the main database
+            connection_test = False
+            try:
+                with current_app.app_context():
+                    db.session.execute('SELECT 1')
+                    connection_test = True
+            except:
+                pass
+            
+            return {
+                'database_uri': db_uri,
+                'current_directory': current_dir,
+                'db_files_found': db_files,
+                'sqlalchemy_connection': connection_test,
+                'config_loaded': bool(current_app.config)
+            }
+        except Exception as e:
             return {'error': str(e)}
 
     def _get_project_db_path(self, project_id: int) -> str:

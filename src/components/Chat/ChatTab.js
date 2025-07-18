@@ -1,15 +1,18 @@
 // src/components/Chat/ChatTab.js
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  PaperAirplaneIcon,
   ChatBubbleLeftRightIcon,
-  SparklesIcon,
+  PaperAirplaneIcon,
   ClockIcon,
   CheckCircleIcon,
   ExclamationTriangleIcon,
-  CodeBracketIcon,
+  ArrowPathIcon,
+  PlayIcon,
+  PlusIcon,
+  TrashIcon,
+  DocumentTextIcon,
   TableCellsIcon,
-  ArrowPathIcon
+  CpuChipIcon
 } from '@heroicons/react/24/outline';
 import { useProject } from '../../contexts/ProjectContext';
 import toast from 'react-hot-toast';
@@ -19,26 +22,40 @@ const ChatTab = () => {
   const { activeProject } = useProject();
   const [query, setQuery] = useState('');
   const [chatHistory, setChatHistory] = useState([]);
-  const [currentChat, setCurrentChat] = useState(null);
+  const [sessions, setSessions] = useState([]);
+  const [selectedSession, setSelectedSession] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [currentChat, setCurrentChat] = useState(null);
   const [currentStep, setCurrentStep] = useState(null);
   const [sessionId, setSessionId] = useState(null);
-  const [sessions, setSessions] = useState([]);
-  const chatEndRef = useRef(null);
-  const queryInputRef = useRef(null);
+  const [llmAvailable, setLlmAvailable] = useState(false);
 
   useEffect(() => {
     if (activeProject) {
       loadSessions();
+      checkLlmAvailability();
     }
   }, [activeProject]);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [chatHistory, currentChat]);
+    if (selectedSession) {
+      loadChatHistory(selectedSession);
+    }
+  }, [selectedSession]);
 
-  const scrollToBottom = () => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  const checkLlmAvailability = async () => {
+    try {
+      const response = await fetch(`/api/chat/${activeProject.id}/llm-status`);
+      const data = await response.json();
+      setLlmAvailable(data.available);
+      
+      if (!data.available) {
+        toast.error('LLM service not available. Please configure Azure OpenAI settings.');
+      }
+    } catch (error) {
+      console.error('Error checking LLM availability:', error);
+      setLlmAvailable(false);
+    }
   };
 
   const loadSessions = async () => {
@@ -56,22 +73,74 @@ const ChatTab = () => {
     }
   };
 
-  const loadChatHistory = async (selectedSessionId) => {
+  const loadChatHistory = async (sessionId) => {
+    if (!activeProject || !sessionId) return;
+
     try {
-      const response = await fetch(`/api/chat/${activeProject.id}/sessions/${selectedSessionId}`);
+      const response = await fetch(`/api/chat/${activeProject.id}/sessions/${sessionId}`);
       const data = await response.json();
 
       if (data.status === 'success') {
-        setChatHistory(data.chat_history);
-        setSessionId(selectedSessionId);
+        // Convert backend chat history to frontend format
+        const formattedHistory = data.chat_history.map(chat => ({
+          type: 'assistant',
+          content: chat.final_response || 'Processing...',
+          sql_query: chat.generated_sql,
+          results: chat.sql_results,
+          processing_time: chat.processing_time,
+          timestamp: chat.created_at,
+          status: chat.status,
+          userQuery: chat.user_query
+        }));
+
+        setChatHistory(formattedHistory);
+        setSessionId(sessionId);
       }
     } catch (error) {
       console.error('Error loading chat history:', error);
     }
   };
 
+  const createNewSession = () => {
+    setSelectedSession(null);
+    setSessionId(null);
+    setChatHistory([]);
+    setCurrentChat(null);
+    setCurrentStep(null);
+  };
+
+  const deleteSession = async (sessionId) => {
+    if (!window.confirm('Are you sure you want to delete this chat session?')) return;
+
+    try {
+      const response = await fetch(`/api/chat/${activeProject.id}/sessions/${sessionId}`, {
+        method: 'DELETE',
+      });
+
+      const data = await response.json();
+
+      if (data.status === 'success') {
+        toast.success('Session deleted');
+        loadSessions();
+        if (selectedSession === sessionId) {
+          createNewSession();
+        }
+      } else {
+        toast.error('Failed to delete session');
+      }
+    } catch (error) {
+      console.error('Error deleting session:', error);
+      toast.error('Failed to delete session');
+    }
+  };
+
   const handleQuickQuery = async () => {
     if (!query.trim() || !activeProject) return;
+
+    if (!llmAvailable) {
+      toast.error('LLM service not available. Please configure Azure OpenAI settings.');
+      return;
+    }
 
     setLoading(true);
     setCurrentChat(null);
@@ -124,7 +193,7 @@ const ChatTab = () => {
           timestamp: new Date().toISOString()
         };
         setChatHistory(prev => [...prev, errorMessage]);
-        toast.error('Query failed');
+        toast.error(data.error || 'Query failed');
       }
     } catch (error) {
       console.error('Error running query:', error);
@@ -142,6 +211,11 @@ const ChatTab = () => {
 
   const handleStepByStepQuery = async () => {
     if (!query.trim() || !activeProject) return;
+
+    if (!llmAvailable) {
+      toast.error('LLM service not available. Please configure Azure OpenAI settings.');
+      return;
+    }
 
     setLoading(true);
     setCurrentStep('extract_entities');
@@ -243,7 +317,43 @@ const ChatTab = () => {
   };
 
   const formatTimestamp = (timestamp) => {
-    return new Date(timestamp).toLocaleTimeString();
+    if (!timestamp) return '';
+    
+    try {
+      // Handle both ISO strings and date objects
+      const date = typeof timestamp === 'string' ? new Date(timestamp) : timestamp;
+      
+      // Check if date is valid
+      if (isNaN(date.getTime())) {
+        return 'Invalid time';
+      }
+      
+      return date.toLocaleTimeString([], { 
+        hour: '2-digit', 
+        minute: '2-digit',
+        hour12: true 
+      });
+    } catch (error) {
+      console.error('Error formatting timestamp:', error);
+      return 'Invalid time';
+    }
+  };
+
+  const formatDate = (timestamp) => {
+    if (!timestamp) return '';
+    
+    try {
+      const date = typeof timestamp === 'string' ? new Date(timestamp) : timestamp;
+      
+      if (isNaN(date.getTime())) {
+        return 'Invalid date';
+      }
+      
+      return date.toLocaleDateString();
+    } catch (error) {
+      console.error('Error formatting date:', error);
+      return 'Invalid date';
+    }
   };
 
   if (!activeProject) {
@@ -265,42 +375,70 @@ const ChatTab = () => {
       {/* Sidebar - Chat Sessions */}
       <div className="w-80 bg-white border-r border-gray-200 flex flex-col">
         <div className="p-4 border-b border-gray-200">
-          <h3 className="text-lg font-medium text-gray-900">Chat Sessions</h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-medium text-gray-900">Chat Sessions</h3>
+            <button
+              onClick={createNewSession}
+              className="p-2 text-gray-400 hover:text-gray-600 rounded"
+              title="New Session"
+            >
+              <PlusIcon className="h-5 w-5" />
+            </button>
+          </div>
           <p className="text-sm text-gray-500 mt-1">
             {sessions.length} previous conversations
           </p>
+          
+          {/* LLM Status Indicator */}
+          <div className={`mt-2 flex items-center text-sm ${llmAvailable ? 'text-green-600' : 'text-red-600'}`}>
+            <div className={`w-2 h-2 rounded-full mr-2 ${llmAvailable ? 'bg-green-500' : 'bg-red-500'}`}></div>
+            {llmAvailable ? 'LLM Available' : 'LLM Unavailable'}
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto">
           {sessions.length === 0 ? (
             <div className="p-4 text-center text-gray-500">
-              <p className="text-sm">No previous sessions</p>
+              <ChatBubbleLeftRightIcon className="mx-auto h-8 w-8 mb-2" />
+              <p className="text-sm">No chat sessions yet</p>
             </div>
           ) : (
             <div className="space-y-1 p-2">
               {sessions.map((session) => (
-                <button
+                <div
                   key={session.session_id}
-                  onClick={() => loadChatHistory(session.session_id)}
-                  className={`w-full text-left p-3 rounded-lg hover:bg-gray-50 transition-colors ${
-                    session.session_id === sessionId ? 'bg-blue-50 border border-blue-200' : ''
+                  className={`p-3 rounded-lg cursor-pointer transition-colors ${
+                    selectedSession === session.session_id
+                      ? 'bg-blue-50 border border-blue-200'
+                      : 'hover:bg-gray-50'
                   }`}
+                  onClick={() => setSelectedSession(session.session_id)}
                 >
                   <div className="flex items-start justify-between">
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-gray-900 truncate">
-                        {session.first_query}
+                        {session.first_query || 'Untitled Chat'}
                       </p>
-                      <div className="flex items-center mt-1 text-xs text-gray-500">
+                      <div className="flex items-center text-xs text-gray-500 mt-1">
                         <ClockIcon className="h-3 w-3 mr-1" />
-                        {new Date(session.last_activity).toLocaleDateString()}
+                        {formatDate(session.last_activity)}
                       </div>
+                      <p className="text-xs text-gray-500 mt-1">
+                        {session.query_count} queries
+                      </p>
                     </div>
-                    <span className="text-xs text-gray-400 ml-2">
-                      {session.query_count}
-                    </span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteSession(session.session_id);
+                      }}
+                      className="p-1 text-gray-400 hover:text-red-600 rounded"
+                      title="Delete Session"
+                    >
+                      <TrashIcon className="h-4 w-4" />
+                    </button>
                   </div>
-                </button>
+                </div>
               ))}
             </div>
           )}
@@ -309,121 +447,80 @@ const ChatTab = () => {
 
       {/* Main Chat Area */}
       <div className="flex-1 flex flex-col">
-        {/* Chat Header */}
-        <div className="bg-white border-b border-gray-200 px-6 py-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-lg font-semibold text-gray-900">
-                Natural Language Chat
-              </h2>
-              <p className="text-sm text-gray-600 mt-1">
-                Ask questions about your data in plain English
-              </p>
-            </div>
-
-            {sessionId && (
-              <div className="text-sm text-gray-500">
-                Session: {sessionId.slice(0, 8)}...
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Chat Messages */}
-        <div className="flex-1 overflow-y-auto p-6">
-          {chatHistory.length === 0 && !currentChat ? (
+        {/* Chat History */}
+        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+          {chatHistory.length === 0 ? (
             <div className="text-center py-12">
-              <SparklesIcon className="mx-auto h-12 w-12 text-blue-400" />
-              <h3 className="mt-4 text-lg font-medium text-gray-900">
-                Start a conversation
+              <ChatBubbleLeftRightIcon className="mx-auto h-12 w-12 text-gray-400" />
+              <h3 className="mt-2 text-sm font-medium text-gray-900">
+                {selectedSession ? 'Chat History' : 'Start a Conversation'}
               </h3>
-              <p className="mt-2 text-sm text-gray-500 max-w-sm mx-auto">
-                Ask questions about your data, and I'll help you find the answers using natural language processing.
+              <p className="mt-1 text-sm text-gray-500">
+                {selectedSession 
+                  ? 'Loading chat history...' 
+                  : 'Ask questions about your data using natural language'}
               </p>
-              
-              <div className="mt-6 space-y-2">
-                <p className="text-sm font-medium text-gray-700">Try asking:</p>
-                <div className="space-y-1 text-sm text-gray-600">
-                  <p>"Show me all customers from last month"</p>
-                  <p>"What are the top 10 products by sales?"</p>
-                  <p>"How many orders were placed this year?"</p>
-                </div>
-              </div>
             </div>
           ) : (
-            <div className="space-y-6">
-              {/* Chat History */}
-              {chatHistory.map((message, index) => (
-                <ChatMessage key={index} message={message} />
-              ))}
+            chatHistory.map((message, index) => (
+              <ChatMessage key={index} message={message} />
+            ))
+          )}
 
-              {/* Current Step-by-Step Processing */}
-              {currentChat && (
-                <StepByStepInterface
-                  chat={currentChat}
-                  step={currentStep}
-                  onConfirm={handleStepConfirmation}
-                  loading={loading}
-                />
-              )}
-
-              {/* Loading Indicator */}
-              {loading && !currentChat && (
-                <div className="flex items-center space-x-2 text-gray-500">
-                  <LoadingSpinner size="small" />
-                  <span className="text-sm">Processing your query...</span>
-                </div>
-              )}
-
-              <div ref={chatEndRef} />
-            </div>
+          {/* Step-by-step workflow */}
+          {currentChat && currentStep && (
+            <StepByStepWorkflow
+              chat={currentChat}
+              step={currentStep}
+              onConfirm={handleStepConfirmation}
+              loading={loading}
+            />
           )}
         </div>
 
         {/* Input Area */}
         <div className="border-t border-gray-200 bg-white p-4">
-          <div className="flex items-end space-x-3">
+          <div className="flex space-x-4">
             <div className="flex-1">
               <textarea
-                ref={queryInputRef}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyPress={handleKeyPress}
-                placeholder="Ask a question about your data..."
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg resize-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder={llmAvailable ? "Ask a question about your data..." : "LLM service unavailable - please configure Azure OpenAI"}
+                disabled={loading || !llmAvailable}
+                className="w-full resize-none border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                 rows={2}
-                disabled={loading}
               />
             </div>
-            
-            <div className="flex space-x-2">
+            <div className="flex flex-col space-y-2">
               <button
                 onClick={handleQuickQuery}
-                disabled={!query.trim() || loading}
-                className="p-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                disabled={loading || !query.trim() || !llmAvailable}
+                className="btn-primary disabled:opacity-50 flex items-center"
                 title="Quick Query"
               >
-                <PaperAirplaneIcon className="h-5 w-5" />
+                {loading ? (
+                  <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                ) : (
+                  <PaperAirplaneIcon className="h-4 w-4" />
+                )}
               </button>
-              
               <button
                 onClick={handleStepByStepQuery}
-                disabled={!query.trim() || loading}
-                className="p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                title="Step-by-Step Query"
+                disabled={loading || !query.trim() || !llmAvailable}
+                className="btn-secondary disabled:opacity-50 flex items-center"
+                title="Step-by-step Query"
               >
-                <SparklesIcon className="h-5 w-5" />
+                <PlayIcon className="h-4 w-4" />
               </button>
             </div>
           </div>
           
-          <div className="flex items-center justify-between mt-2 text-xs text-gray-500">
-            <span>Press Enter to send, Shift+Enter for new line</span>
-            <div className="flex space-x-4">
-              <span>Quick: Fast processing</span>
-              <span>Step-by-step: Guided with confirmations</span>
+          {!llmAvailable && (
+            <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-sm text-yellow-800">
+              ⚠️ LLM service unavailable. Please configure Azure OpenAI in your environment variables.
             </div>
-          </div>
+          )}
         </div>
       </div>
     </div>
@@ -432,277 +529,207 @@ const ChatTab = () => {
 
 // Chat Message Component
 const ChatMessage = ({ message }) => {
-  const isUser = message.type === 'user';
-  const isError = message.type === 'error';
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return '';
+    
+    try {
+      const date = typeof timestamp === 'string' ? new Date(timestamp) : timestamp;
+      if (isNaN(date.getTime())) return 'Invalid time';
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+    } catch (error) {
+      return 'Invalid time';
+    }
+  };
 
-  return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <div className={`max-w-3xl ${isUser ? 'ml-12' : 'mr-12'}`}>
-        <div
-          className={`p-4 rounded-lg ${
-            isUser
-              ? 'bg-blue-600 text-white'
-              : isError
-              ? 'bg-red-50 border border-red-200 text-red-800'
-              : 'bg-gray-100 text-gray-900'
-          }`}
-        >
-          <p className="whitespace-pre-wrap">{message.content}</p>
-          
-          {/* SQL Query Display */}
-          {message.sql_query && (
-            <div className="mt-3 p-3 bg-gray-900 text-gray-100 rounded text-sm font-mono overflow-x-auto">
-              <div className="flex items-center mb-2">
-                <CodeBracketIcon className="h-4 w-4 mr-2" />
-                <span className="font-medium">Generated SQL:</span>
-              </div>
-              <pre>{message.sql_query}</pre>
-            </div>
-          )}
-          
-          {/* Results Summary */}
-          {message.results && (
-            <div className="mt-3 p-3 bg-white bg-opacity-20 rounded">
-              <div className="flex items-center justify-between text-sm">
-                <div className="flex items-center">
-                  <TableCellsIcon className="h-4 w-4 mr-2" />
-                  <span>{message.result_count} results found</span>
-                </div>
-                {message.processing_time && (
-                  <span>{message.processing_time}s</span>
-                )}
-              </div>
-            </div>
-          )}
+  if (message.type === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div className="bg-blue-600 text-white rounded-lg px-4 py-2 max-w-2xl">
+          <p>{message.content}</p>
+          <p className="text-xs text-blue-100 mt-1">{formatTimestamp(message.timestamp)}</p>
         </div>
+      </div>
+    );
+  }
+
+  if (message.type === 'error') {
+    return (
+      <div className="flex">
+        <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-2 max-w-2xl">
+          <div className="flex items-center text-red-800">
+            <ExclamationTriangleIcon className="h-5 w-5 mr-2" />
+            <p className="font-medium">Error</p>
+          </div>
+          <p className="text-red-700 mt-1">{message.content}</p>
+          <p className="text-xs text-red-500 mt-1">{formatTimestamp(message.timestamp)}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Assistant message
+  return (
+    <div className="flex">
+      <div className="bg-gray-100 rounded-lg px-4 py-2 max-w-4xl">
+        {message.userQuery && (
+          <div className="text-sm text-gray-600 mb-2 font-medium">
+            Query: {message.userQuery}
+          </div>
+        )}
         
-        <div className={`text-xs text-gray-500 mt-1 ${isUser ? 'text-right' : 'text-left'}`}>
-          {formatTimestamp(message.timestamp)}
+        <div className="prose max-w-none">
+          <p className="text-gray-900">{message.content}</p>
+        </div>
+
+        {message.sql_query && (
+          <div className="mt-3 bg-gray-800 text-gray-100 rounded p-3">
+            <div className="flex items-center mb-2">
+              <DocumentTextIcon className="h-4 w-4 mr-2" />
+              <span className="font-medium text-sm">Generated SQL</span>
+            </div>
+            <pre className="text-sm overflow-x-auto">{message.sql_query}</pre>
+          </div>
+        )}
+
+        {message.results && message.results.length > 0 && (
+          <div className="mt-3">
+            <div className="flex items-center mb-2">
+              <TableCellsIcon className="h-4 w-4 mr-2" />
+              <span className="font-medium text-sm">Results ({message.result_count || message.results.length})</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200 text-sm">
+                <thead className="bg-gray-50">
+                  <tr>
+                    {Object.keys(message.results[0]).map((key) => (
+                      <th key={key} className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+                        {key}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200">
+                  {message.results.slice(0, 10).map((row, idx) => (
+                    <tr key={idx}>
+                      {Object.values(row).map((value, valueIdx) => (
+                        <td key={valueIdx} className="px-3 py-2 whitespace-nowrap text-gray-900">
+                          {value !== null ? String(value) : 'NULL'}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {message.results.length > 10 && (
+                <p className="text-xs text-gray-500 mt-2">
+                  ... and {message.results.length - 10} more rows
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between mt-3 text-xs text-gray-500">
+          <span>{formatTimestamp(message.timestamp)}</span>
+          {message.processing_time && (
+            <span>Processing: {message.processing_time}s</span>
+          )}
         </div>
       </div>
     </div>
   );
 };
 
-// Step-by-Step Interface Component
-const StepByStepInterface = ({ chat, step, onConfirm, loading }) => {
-  const [selectedEntities, setSelectedEntities] = useState([]);
-  const [selectedMappings, setSelectedMappings] = useState([]);
-
-  const handleConfirmEntities = () => {
-    onConfirm('confirm_entities', { confirmed_entities: selectedEntities });
-  };
-
-  const handleConfirmMappings = () => {
-    onConfirm('confirm_mappings', { selected_mappings: selectedMappings });
-  };
-
-  const handleGenerateSQL = () => {
-    onConfirm('generate_sql', {});
-  };
-
-  const handleExecuteSQL = () => {
-    onConfirm('execute_sql', {});
+// Step-by-step Workflow Component
+const StepByStepWorkflow = ({ chat, step, onConfirm, loading }) => {
+  const getStepIcon = (stepName) => {
+    switch (stepName) {
+      case 'confirm_entities':
+        return <CpuChipIcon className="h-5 w-5" />;
+      case 'confirm_mappings':
+        return <TableCellsIcon className="h-5 w-5" />;
+      case 'execute_sql':
+        return <PlayIcon className="h-5 w-5" />;
+      default:
+        return <CheckCircleIcon className="h-5 w-5" />;
+    }
   };
 
   return (
-    <div className="bg-blue-50 border border-blue-200 rounded-lg p-6">
-      <div className="flex items-center mb-4">
-        <ArrowPathIcon className="h-5 w-5 text-blue-600 mr-2" />
-        <h4 className="font-medium text-blue-900">Step-by-Step Processing</h4>
+    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+      <div className="flex items-center mb-3">
+        {getStepIcon(step)}
+        <h4 className="ml-2 font-medium text-blue-900">
+          {step === 'confirm_entities' && 'Confirm Extracted Entities'}
+          {step === 'confirm_mappings' && 'Confirm Entity Mappings'}
+          {step === 'execute_sql' && 'Execute Generated SQL'}
+        </h4>
       </div>
 
-      {step === 'confirm_entities' && (
-        <EntityConfirmation
-          entities={chat.entities}
-          selectedEntities={selectedEntities}
-          setSelectedEntities={setSelectedEntities}
-          onConfirm={handleConfirmEntities}
-          loading={loading}
-        />
-      )}
-
-      {step === 'confirm_mappings' && (
-        <MappingConfirmation
-          mappings={chat.mapping_results}
-          selectedMappings={selectedMappings}
-          setSelectedMappings={setSelectedMappings}
-          onConfirm={handleConfirmMappings}
-          loading={loading}
-        />
-      )}
-
-      {step === 'generate_sql' && (
-        <SQLGeneration
-          onConfirm={handleGenerateSQL}
-          loading={loading}
-        />
-      )}
-
-      {step === 'execute_sql' && (
-        <SQLExecution
-          sqlQuery={chat.generated_sql}
-          onConfirm={handleExecuteSQL}
-          loading={loading}
-        />
-      )}
-    </div>
-  );
-};
-
-// Entity Confirmation Component
-const EntityConfirmation = ({ entities, selectedEntities, setSelectedEntities, onConfirm, loading }) => {
-  const toggleEntity = (entity) => {
-    setSelectedEntities(prev => {
-      const exists = prev.find(e => e.text === entity.text);
-      if (exists) {
-        return prev.filter(e => e.text !== entity.text);
-      } else {
-        return [...prev, entity];
-      }
-    });
-  };
-
-  return (
-    <div>
-      <h5 className="font-medium text-gray-900 mb-3">
-        Confirm Extracted Entities ({entities.length})
-      </h5>
-      
-      <div className="space-y-2 mb-4">
-        {entities.map((entity, index) => (
-          <label key={index} className="flex items-center space-x-3 p-2 hover:bg-white rounded">
-            <input
-              type="checkbox"
-              checked={selectedEntities.some(e => e.text === entity.text)}
-              onChange={() => toggleEntity(entity)}
-              className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-            />
-            <div className="flex-1">
-              <span className="font-medium">{entity.text}</span>
-              <span className="ml-2 text-sm text-gray-500">({entity.type})</span>
-              {entity.confidence && (
-                <span className="ml-2 text-xs text-gray-400">
-                  {Math.round(entity.confidence * 100)}%
-                </span>
-              )}
-            </div>
-          </label>
-        ))}
-      </div>
-
-      <button
-        onClick={onConfirm}
-        disabled={selectedEntities.length === 0 || loading}
-        className="btn-primary disabled:opacity-50"
-      >
-        {loading ? 'Processing...' : `Confirm ${selectedEntities.length} Entities`}
-      </button>
-    </div>
-  );
-};
-
-// Mapping Confirmation Component
-const MappingConfirmation = ({ mappings, selectedMappings, setSelectedMappings, onConfirm, loading }) => {
-  const combinedResults = mappings.combined_results || [];
-
-  const toggleMapping = (mapping) => {
-    setSelectedMappings(prev => {
-      const exists = prev.find(m => 
-        m.type === mapping.type && 
-        m.id === mapping.id && 
-        m.name === mapping.name
-      );
-      if (exists) {
-        return prev.filter(m => !(m.type === mapping.type && m.id === mapping.id));
-      } else {
-        return [...prev, mapping];
-      }
-    });
-  };
-
-  return (
-    <div>
-      <h5 className="font-medium text-gray-900 mb-3">
-        Confirm Entity Mappings ({combinedResults.length})
-      </h5>
-      
-      <div className="space-y-2 mb-4 max-h-60 overflow-y-auto">
-        {combinedResults.map((mapping, index) => (
-          <label key={index} className="flex items-center space-x-3 p-2 hover:bg-white rounded">
-            <input
-              type="checkbox"
-              checked={selectedMappings.some(m => 
-                m.type === mapping.type && m.id === mapping.id
-              )}
-              onChange={() => toggleMapping(mapping)}
-              className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-            />
-            <div className="flex-1">
-              <span className="font-medium">
-                {mapping.name || mapping.term || mapping.table_name}
+      {step === 'confirm_entities' && chat.entities && (
+        <div className="space-y-3">
+          <p className="text-sm text-blue-800">
+            I found these entities in your query. Please confirm:
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {chat.entities.map((entity, idx) => (
+              <span key={idx} className="bg-blue-100 text-blue-800 px-2 py-1 rounded text-sm">
+                {entity.text} ({entity.type})
               </span>
-              <span className="ml-2 text-sm text-gray-500">({mapping.type})</span>
-              <span className="ml-2 text-xs text-blue-600">
-                {Math.round(mapping.confidence * 100)}%
-              </span>
-              {mapping.table_name && mapping.column_name && (
-                <div className="text-xs text-gray-500">
-                  {mapping.table_name}.{mapping.column_name}
-                </div>
-              )}
-            </div>
-          </label>
-        ))}
-      </div>
+            ))}
+          </div>
+          <button
+            onClick={() => onConfirm('confirm_entities', { confirmed_entities: chat.entities })}
+            disabled={loading}
+            className="btn-primary disabled:opacity-50"
+          >
+            {loading ? 'Processing...' : 'Confirm Entities'}
+          </button>
+        </div>
+      )}
 
-      <button
-        onClick={onConfirm}
-        disabled={selectedMappings.length === 0 || loading}
-        className="btn-primary disabled:opacity-50"
-      >
-        {loading ? 'Processing...' : `Confirm ${selectedMappings.length} Mappings`}
-      </button>
+      {step === 'confirm_mappings' && chat.mapping_results && (
+        <div className="space-y-3">
+          <p className="text-sm text-blue-800">
+            Found these potential mappings. Please confirm:
+          </p>
+          <div className="max-h-40 overflow-y-auto space-y-2">
+            {chat.mapping_results.combined_results?.slice(0, 5).map((mapping, idx) => (
+              <div key={idx} className="bg-white p-2 rounded border">
+                <span className="font-medium">{mapping.name || mapping.term}</span>
+                <span className="text-sm text-gray-600 ml-2">({mapping.type})</span>
+              </div>
+            ))}
+          </div>
+          <button
+            onClick={() => onConfirm('confirm_mappings', { confirmed_mappings: chat.mapping_results.combined_results?.slice(0, 5) })}
+            disabled={loading}
+            className="btn-primary disabled:opacity-50"
+          >
+            {loading ? 'Processing...' : 'Confirm Mappings'}
+          </button>
+        </div>
+      )}
+
+      {step === 'execute_sql' && chat.generated_sql && (
+        <div className="space-y-3">
+          <p className="text-sm text-blue-800">
+            Generated SQL query. Execute to get results:
+          </p>
+          <div className="bg-gray-800 text-gray-100 rounded p-3">
+            <pre className="text-sm overflow-x-auto">{chat.generated_sql}</pre>
+          </div>
+          <button
+            onClick={() => onConfirm('execute_sql', { execute: true })}
+            disabled={loading}
+            className="btn-primary disabled:opacity-50"
+          >
+            {loading ? 'Executing...' : 'Execute SQL'}
+          </button>
+        </div>
+      )}
     </div>
   );
-};
-
-// SQL Generation Component
-const SQLGeneration = ({ onConfirm, loading }) => (
-  <div>
-    <h5 className="font-medium text-gray-900 mb-3">Generate SQL Query</h5>
-    <p className="text-sm text-gray-600 mb-4">
-      Ready to generate SQL query based on confirmed entities and mappings.
-    </p>
-    <button
-      onClick={onConfirm}
-      disabled={loading}
-      className="btn-primary disabled:opacity-50"
-    >
-      {loading ? 'Generating...' : 'Generate SQL'}
-    </button>
-  </div>
-);
-
-// SQL Execution Component
-const SQLExecution = ({ sqlQuery, onConfirm, loading }) => (
-  <div>
-    <h5 className="font-medium text-gray-900 mb-3">Execute SQL Query</h5>
-    <div className="bg-gray-900 text-gray-100 p-3 rounded text-sm font-mono mb-4 overflow-x-auto">
-      <pre>{sqlQuery}</pre>
-    </div>
-    <button
-      onClick={onConfirm}
-      disabled={loading}
-      className="btn-primary disabled:opacity-50"
-    >
-      {loading ? 'Executing...' : 'Execute Query'}
-    </button>
-  </div>
-);
-
-const formatTimestamp = (timestamp) => {
-  return new Date(timestamp).toLocaleTimeString();
 };
 
 export default ChatTab;
